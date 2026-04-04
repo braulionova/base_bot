@@ -1,0 +1,9 @@
+target/
+out/
+cache/
+bot.log
+pools_cache.json
+prioritized_routes.json
+*.log
+__pycache__/
+*.pkl
