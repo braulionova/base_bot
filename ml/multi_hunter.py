@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 """
 Multi-Strategy Hunter
@@ -10,11 +11,11 @@ import json, subprocess, time, urllib.request, urllib.parse
 from collections import defaultdict, Counter
 
 CONTRACT = "0xA5D20A16aEB02C30b1611C382FA516aE46710664"
-PK = "0xfb7d62cfba588e53df82089cb9ad1b99397b8718e821b23585f6608c01d2de61"
+PK = os.environ.get("PRIVATE_KEY", "")
 WALLET = "0xd69F9856A569B1655B43B0395b7c2923a217Cfe0"
 WETH = "0x4200000000000000000000000000000000000006".lower()
-TG = "7700486521:AAFuu2ygokFNesm1uB6_JM96KxQwcc4q-dk"
-CHAT = "483428397"
+TG = os.environ.get("TG_TOKEN", "")
+CHAT = os.environ.get("TG_CHAT", "")
 RPCS = ["https://mainnet.base.org","https://base.publicnode.com","https://base-mainnet.public.blastapi.io"]
 ri = 0
 V3_SWAP = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"

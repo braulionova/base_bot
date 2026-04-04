@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 """
 Execute ML-prioritized longtail routes via flash swap contract.
@@ -10,7 +11,7 @@ import sys
 import time
 
 CONTRACT = "0x275690F4F52E3023093Cb396E5633f0e3002571F"
-PK = "0xfb7d62cfba588e53df82089cb9ad1b99397b8718e821b23585f6608c01d2de61"
+PK = os.environ.get("PRIVATE_KEY", "")
 WALLET = "0xd69F9856A569B1655B43B0395b7c2923a217Cfe0"
 RPC = "https://mainnet.base.org"
 ROUTES_FILE = "/root/arb-flash-bot/prioritized_routes.json"
