@@ -75,18 +75,10 @@ impl PairIndex {
             }
         }
 
-        // Pre-compute cross-DEX arbable pairs
+        // Pre-compute arbable pairs: any pair with 2+ pools (cross-DEX or same-DEX different fee tiers)
         let mut arbable_pairs = Vec::new();
         for (_pair, addrs) in &pair_to_pools {
-            if addrs.len() < 2 { continue; }
-            // Check that at least 2 different DEXes exist
-            let mut dex_set = std::collections::HashSet::new();
-            for addr in addrs {
-                if let Some(p) = pools.get(addr) {
-                    dex_set.insert(p.dex_name.clone());
-                }
-            }
-            if dex_set.len() >= 2 {
+            if addrs.len() >= 2 {
                 arbable_pairs.push(addrs.clone());
             }
         }
@@ -111,15 +103,33 @@ pub struct ArbitrageEngine {
 }
 
 // Coarse trade sizes for initial scan (find profitable direction fast)
-const SCAN_SIZES: [u128; 4] = [
-    30_000_000_000_000_000,  // 0.03 ETH
+const SCAN_SIZES: [u128; 6] = [
+    500_000_000_000_000_000, // 0.5 ETH
+    200_000_000_000_000_000, // 0.2 ETH
+    50_000_000_000_000_000,  // 0.05 ETH
     10_000_000_000_000_000,  // 0.01 ETH
     3_000_000_000_000_000,   // 0.003 ETH
     1_000_000_000_000_000,   // 0.001 ETH
 ];
 
 /// Minimum liquidity in reserve to consider a pool (avoid dust pools)
-const MIN_RESERVE_WEI: u128 = 100_000_000_000_000; // 0.0001 ETH equivalent
+const MIN_RESERVE_WEI: u128 = 10_000_000_000_000_000; // 0.01 ETH — filter dust/honeypot pools
+
+use alloy::primitives::address;
+
+/// Anchor tokens for non-WETH arb (stablecoins + LSTs that are safe to trade)
+fn stable_anchors() -> &'static [Address] {
+    static ANCHORS: std::sync::OnceLock<Vec<Address>> = std::sync::OnceLock::new();
+    ANCHORS.get_or_init(|| vec![
+        address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"), // USDC
+        address!("d9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA"), // USDbC
+        address!("50c5725949A6F0c72E6C4a641F24049A917DB0Cb"), // DAI
+        address!("2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22"), // cbETH
+        address!("c1CBa3fCea344f92D9239c08C0568f6F2F0ee452"), // wstETH
+        address!("04C0599Ae5A44757c0af6F9eC3b93da8976c150A"), // weETH
+        address!("cbb7c0000ab88b473b1f5afd9ef808440eed33bf"), // cbBTC
+    ])
+}
 
 impl ArbitrageEngine {
     pub fn new(rpc: Arc<MultiRpcProvider>) -> Self {
@@ -129,6 +139,11 @@ impl ArbitrageEngine {
             weth,
             reserve_cache: DashMap::new(),
         }
+    }
+
+    /// Check if a token is a known stable/anchor token safe for non-WETH arb
+    fn is_stable_anchor(&self, token: Address) -> bool {
+        stable_anchors().contains(&token)
     }
 
     /// Refresh reserves via parallel multicall across all RPC providers.
@@ -236,7 +251,15 @@ impl ArbitrageEngine {
                         _ => continue,
                     };
 
-                    if pool_a.dex_name == pool_b.dex_name {
+                    // Allow same-DEX pairs (different fee tiers, e.g. V3 0.05% vs 0.3%)
+                    if pool_a.dex_name == pool_b.dex_name && pool_a.address == pool_b.address {
+                        continue;
+                    }
+
+                    // Only arb pairs where at least one token is WETH or a known anchor
+                    if pool_a.token0 != self.weth && pool_a.token1 != self.weth
+                        && !self.is_stable_anchor(pool_a.token0) && !self.is_stable_anchor(pool_a.token1)
+                    {
                         continue;
                     }
 
@@ -250,7 +273,9 @@ impl ArbitrageEngine {
         }
 
         // 2. Triangular arb: WETH -> A -> B -> WETH
-        for &pool1_addr in index.weth_pools.iter().take(200) {
+        // Only scan pools that have cached reserves (skip uninitialized)
+        for &pool1_addr in index.weth_pools.iter().take(5000) {
+            if !self.reserve_cache.contains_key(&pool1_addr) { continue; }
             let pool1 = match pools.get(&pool1_addr) {
                 Some(p) => p,
                 None => continue,
@@ -258,7 +283,7 @@ impl ArbitrageEngine {
             let token_a = if pool1.token0 == self.weth { pool1.token1 } else { pool1.token0 };
 
             if let Some(a_pool_addrs) = index.token_to_pools.get(&token_a) {
-                for &pool2_addr in a_pool_addrs.iter().take(50) {
+                for &pool2_addr in a_pool_addrs.iter().take(200) {
                     let pool2 = match pools.get(&pool2_addr) {
                         Some(p) => p,
                         None => continue,
@@ -288,6 +313,19 @@ impl ArbitrageEngine {
 
         opportunities.sort_unstable_by(|a, b| b.profit_wei.cmp(&a.profit_wei));
 
+        // Dedup: keep only the best opportunity per pool pair
+        {
+            let mut seen = std::collections::HashSet::new();
+            opportunities.retain(|opp| {
+                let key = if opp.pool_a < opp.pool_b {
+                    (opp.pool_a, opp.pool_b)
+                } else {
+                    (opp.pool_b, opp.pool_a)
+                };
+                seen.insert(key)
+            });
+        }
+
         if !opportunities.is_empty() {
             info!("Found {} arbitrage opportunities", opportunities.len());
             for opp in opportunities.iter().take(5) {
@@ -304,9 +342,19 @@ impl ArbitrageEngine {
     /// Check direct arb using cached reserves — NO RPC calls.
     /// Uses coarse scan + binary search to find optimal input amount.
     fn check_pair_arb_cached(&self, pool_a: &Pool, pool_b: &Pool) -> Option<ArbOpportunity> {
+        // Determine token_in and token_bridge — prefer WETH as token_in
         let (token_in, token_bridge) = if pool_a.token0 == self.weth {
             (pool_a.token0, pool_a.token1)
         } else if pool_a.token1 == self.weth {
+            (pool_a.token1, pool_a.token0)
+        } else if self.is_stable_anchor(pool_a.token0)
+            && (pool_a.token0 == pool_b.token0 || pool_a.token0 == pool_b.token1)
+        {
+            // Non-WETH pair — only allow if token_in is a known stable/anchor token
+            (pool_a.token0, pool_a.token1)
+        } else if self.is_stable_anchor(pool_a.token1)
+            && (pool_a.token1 == pool_b.token0 || pool_a.token1 == pool_b.token1)
+        {
             (pool_a.token1, pool_a.token0)
         } else {
             return None;
@@ -344,7 +392,7 @@ impl ArbitrageEngine {
 
         // Phase 2: Binary search around best_size to maximize profit (8 iterations)
         let mut lo = best_size / 3;
-        let mut hi = (best_size * 3).min(100_000_000_000_000_000); // cap at 0.1 ETH
+        let mut hi = (best_size * 3).min(1_000_000_000_000_000_000); // cap at 1.0 ETH
         for _ in 0..8 {
             if hi - lo < 500_000_000_000_000 { break; } // 0.0005 ETH precision
             let mid1 = lo + (hi - lo) / 3;
@@ -367,6 +415,11 @@ impl ArbitrageEngine {
 
         let profit_wei = out_b - optimal_in;
         let profit_eth = wei_to_eth(profit_wei);
+
+        // Sanity check: profit > 10% of input is likely a honeypot/stale data
+        if profit_wei > optimal_in / U256::from(10) {
+            return None;
+        }
 
         Some(ArbOpportunity {
             pool_a: pool_a.address,
@@ -405,8 +458,10 @@ impl ArbitrageEngine {
         }
 
         // Coarse scan for triangular (smaller sizes due to 3 legs)
-        const TRI_SCAN: [u128; 3] = [
-            15_000_000_000_000_000,  // 0.015 ETH
+        const TRI_SCAN: [u128; 5] = [
+            300_000_000_000_000_000, // 0.3 ETH
+            100_000_000_000_000_000, // 0.1 ETH
+            30_000_000_000_000_000,  // 0.03 ETH
             5_000_000_000_000_000,   // 0.005 ETH
             1_500_000_000_000_000,   // 0.0015 ETH
         ];
@@ -431,7 +486,7 @@ impl ArbitrageEngine {
 
         // Ternary search optimization (6 iterations for triangular)
         let mut lo = best_size / 3;
-        let mut hi = (best_size * 3).min(50_000_000_000_000_000); // cap at 0.05 ETH
+        let mut hi = (best_size * 3).min(500_000_000_000_000_000); // cap at 0.5 ETH
         for _ in 0..6 {
             if hi - lo < 500_000_000_000_000 { break; }
             let mid1 = lo + (hi - lo) / 3;
@@ -453,6 +508,11 @@ impl ArbitrageEngine {
 
         let profit_wei = out3 - optimal_in;
         let profit_eth = wei_to_eth(profit_wei);
+
+        // Sanity check: profit > 10% of input is likely a honeypot/stale data
+        if profit_wei > optimal_in / U256::from(10) {
+            return None;
+        }
 
         Some(ArbOpportunity {
             pool_a: pool1.address,
@@ -612,6 +672,6 @@ fn sorted_pair(a: Address, b: Address) -> (Address, Address) {
 /// Convert wei to ETH without string allocation (hot path optimization)
 #[inline]
 pub fn wei_to_eth(wei: U256) -> f64 {
-    let lo: u128 = wei.to::<u128>();
+    let lo: u128 = wei.saturating_to::<u128>();
     lo as f64 / 1e18
 }

@@ -78,7 +78,8 @@ impl RealtimeFeed {
         let v2_created: FixedBytes<32> = V2_PAIR_CREATED.parse().unwrap();
 
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            // Poll every 50ms to react within flashblock window (200ms)
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
             let provider = self.rpc.get();
             let current_block = match provider.get_block_number().await {
@@ -183,7 +184,7 @@ impl RealtimeFeed {
                 let (v3_swaps, v2_swaps) = tokio::join!(v3_fut, v2_fut);
 
                 // Large swap threshold: ~0.5 ETH equivalent (backrun-worthy)
-                let large_threshold = U256::from(500_000_000_000_000_000u128); // 0.5 ETH
+                let large_threshold = U256::from(100_000_000_000_000_000u128); // 0.1 ETH — lower for more backrun chances
 
                 // Mark swapped pools as stale + detect large swaps for backrun
                 for (addr, a0, a1) in v3_swaps.iter() {

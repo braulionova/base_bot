@@ -71,6 +71,42 @@ openssl rand -hex 32 > /data/jwt/jwt.hex
 chmod 600 /data/jwt/jwt.hex
 
 # ============================================================
+# 6b. Download and import Base chain snapshot
+# ============================================================
+# Official Base snapshots from Coinbase — cuts sync from ~24h to ~1-2h
+# Source: https://docs.base.org/guides/run-a-base-node#snapshots
+
+SNAPSHOT_DIR="/data/reth"
+SNAPSHOT_URL="https://base-snapshots.s3.amazonaws.com/mainnet/reth-latest.tar.zst"
+
+echo "Downloading Base chain snapshot (this may take 30-60 min depending on bandwidth)..."
+echo "Source: $SNAPSHOT_URL"
+
+apt-get install -y zstd aria2
+
+# Use aria2c for parallel download (much faster than curl for large files)
+aria2c -x 16 -s 16 -k 64M \
+  --dir=/tmp \
+  --out=reth-snapshot.tar.zst \
+  --continue=true \
+  --max-tries=5 \
+  --retry-wait=10 \
+  --file-allocation=none \
+  "$SNAPSHOT_URL"
+
+echo "Download complete. Extracting snapshot to $SNAPSHOT_DIR ..."
+# Extract directly to reth data directory
+tar --use-compress-program=unzstd -xf /tmp/reth-snapshot.tar.zst -C "$SNAPSHOT_DIR"
+
+echo "Snapshot extracted. Cleaning up..."
+rm -f /tmp/reth-snapshot.tar.zst
+
+echo "Snapshot import complete."
+echo "Data size: $(du -sh $SNAPSHOT_DIR | awk '{print $1}')"
+
+chown -R ubuntu:ubuntu "$SNAPSHOT_DIR"
+
+# ============================================================
 # 7. Create systemd services
 # ============================================================
 
@@ -223,5 +259,5 @@ echo ""
 echo "RPC endpoint: http://<this-ip>:8545"
 echo "WS endpoint:  ws://<this-ip>:8546"
 echo ""
-echo "Sync will take ~12-24 hours for full Base chain."
+echo "Snapshot pre-loaded. Remaining sync should take ~1-2 hours."
 echo "Finished: $(date)"

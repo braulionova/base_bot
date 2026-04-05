@@ -21,20 +21,32 @@ impl Config {
     pub fn base_mainnet() -> Self {
         Self {
             wallet_address: Address::from_str("0xd69f9856a569b1655b43b0395b7c2923a217cfe0").unwrap(),
-            rpc_urls: vec![
-                // Local node first (colocation, <1ms)
-                "http://127.0.0.1:8545".into(),
-                // Public fallbacks while node syncs
-                "https://base.drpc.org".into(),
-                "https://base-mainnet.public.blastapi.io".into(),
-                "https://mainnet.base.org".into(),
-                "https://base-rpc.publicnode.com".into(),
-                "https://base.publicnode.com".into(),
-            ],
+            rpc_urls: {
+                let mut urls = vec![
+                    // Local node first (colocation, <1ms)
+                    "http://127.0.0.1:8545".into(),
+                ];
+                // Extra RPCs from env (comma-separated, e.g. Alchemy/Infura with API keys)
+                if let Ok(extra) = std::env::var("EXTRA_RPC_URLS") {
+                    for url in extra.split(',') {
+                        let u = url.trim();
+                        if !u.is_empty() { urls.push(u.to_string()); }
+                    }
+                }
+                // Public fallbacks (rate-limited)
+                urls.extend([
+                    "https://base.drpc.org".into(),
+                    "https://base-mainnet.public.blastapi.io".into(),
+                    "https://mainnet.base.org".into(),
+                    "https://base-rpc.publicnode.com".into(),
+                    "https://base.publicnode.com".into(),
+                ]);
+                urls
+            },
             chain_id: 8453,
             min_profit_wei: 20_000_000_000_000, // 0.00002 ETH = ~$0.05 target
-            max_trade_size_eth: 0.1,
-            poll_interval_ms: 250, // Faster polling for arb speed
+            max_trade_size_eth: 1.0,
+            poll_interval_ms: 100, // Fast polling for flashblock reaction
             max_pools: 50_000,
             competition_threshold: 3,
             pool_cache_path: "pools_cache.json".into(),

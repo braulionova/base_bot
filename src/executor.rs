@@ -103,6 +103,8 @@ pub struct Executor {
     min_net_profit_wei: u128,
     /// MEV-protect RPC URL (Flashbots-like endpoint for Base)
     mev_rpc_url: Option<String>,
+    /// Dedicated MEV signing provider (sends txs via MEV relay)
+    mev_signing_provider: Option<Arc<dyn Provider>>,
 }
 
 impl Executor {
@@ -121,6 +123,7 @@ impl Executor {
             gas_margin: 1.5,
             min_net_profit_wei: 10_000_000_000_000, // 0.00001 ETH
             mev_rpc_url: std::env::var("MEV_RPC_URL").ok(),
+            mev_signing_provider: None,
         }
     }
 
@@ -140,12 +143,24 @@ impl Executor {
         let address = signer.address();
         self.wallet = address;
 
+        let wallet = EthereumWallet::from(signer.clone());
+
         let provider = ProviderBuilder::new()
-            .wallet(EthereumWallet::from(signer))
+            .wallet(wallet.clone())
             .connect_http(rpc_url.parse()?);
 
         self.signing_provider = Some(Arc::new(provider));
         info!("Signing provider initialized for {}", address);
+
+        // Initialize MEV provider if MEV_RPC_URL is set
+        if let Some(ref mev_url) = self.mev_rpc_url {
+            let mev_provider = ProviderBuilder::new()
+                .wallet(wallet)
+                .connect_http(mev_url.parse()?);
+            self.mev_signing_provider = Some(Arc::new(mev_provider));
+            info!("MEV protect provider initialized: {}", mev_url);
+        }
+
         Ok(())
     }
 
@@ -271,12 +286,20 @@ impl Executor {
             .max_fee_per_gas(base_fee + priority_tip)
             .max_priority_fee_per_gas(priority_tip);
 
+        // Use MEV-protect RPC if available (prevents frontrunning/sandwiching)
+        let send_provider: &dyn Provider = if let Some(ref mev) = self.mev_signing_provider {
+            info!("Sending via MEV-protect RPC");
+            mev.as_ref()
+        } else {
+            signing.as_ref()
+        };
+
         info!(
             "EXEC: {} -> {} | {:.6} ETH in | nonce {} | gas {:.2}gwei",
             opp.dex_a, opp.dex_b, wei_to_eth(opp.amount_in), nonce, gas_price as f64 / 1e9
         );
 
-        match signing.send_transaction(tx).await {
+        match send_provider.send_transaction(tx).await {
             Ok(pending) => {
                 let tx_hash = *pending.tx_hash();
                 info!("TX SENT: {:?} nonce={}", tx_hash, nonce);

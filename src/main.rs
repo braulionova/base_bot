@@ -7,6 +7,7 @@ mod executor;
 mod gas_predictor;
 mod liquidation;
 mod multicall;
+mod oracle_arb;
 mod pnl;
 mod pools;
 mod rpc;
@@ -70,7 +71,7 @@ async fn main() -> eyre::Result<()> {
     ));
 
     let pnl_tracker = Arc::new(Mutex::new(
-        pnl::PnlTracker::load("pnl.json", 50_000_000_000_000_000) // auto-withdraw at 0.05 ETH
+        pnl::PnlTracker::load("pnl.json", 5_000_000_000_000_000) // auto-withdraw at 0.005 ETH (~$10) to self-fund gas
     ));
 
     // ============================================================
@@ -99,21 +100,30 @@ async fn main() -> eyre::Result<()> {
     }
 
     // ============================================================
-    // 4. Pre-filter: cross-DEX arbable pools
+    // 4. Pre-filter: candidate pools for arb (cross-DEX + triangular)
     // ============================================================
-    info!("Pre-filtering for cross-DEX arbable pools...");
+    info!("Pre-filtering candidate pools for arbitrage...");
     let mut pair_map: std::collections::HashMap<
         (alloy::primitives::Address, alloy::primitives::Address),
         Vec<alloy::primitives::Address>,
     > = std::collections::HashMap::new();
 
+    let mut weth_connected: std::collections::HashSet<alloy::primitives::Address> = std::collections::HashSet::new();
+
     for entry in discovery.pools.iter() {
         let p = entry.value();
         let key = if p.token0 < p.token1 { (p.token0, p.token1) } else { (p.token1, p.token0) };
         pair_map.entry(key).or_default().push(p.address);
+        // Track all pools that touch WETH (for triangular arb routes)
+        if p.token0 == weth || p.token1 == weth {
+            weth_connected.insert(p.address);
+        }
     }
 
     let mut arbable_addrs: Vec<alloy::primitives::Address> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    // Include cross-DEX pairs (direct arb)
     for (_pair, addrs) in &pair_map {
         if addrs.len() < 2 { continue; }
         let mut dexes = std::collections::HashSet::new();
@@ -123,10 +133,41 @@ async fn main() -> eyre::Result<()> {
             }
         }
         if dexes.len() >= 2 {
-            arbable_addrs.extend(addrs.iter());
+            for addr in addrs {
+                if seen.insert(*addr) { arbable_addrs.push(*addr); }
+            }
         }
     }
-    info!("Arbable cross-DEX pools: {} (from {} total)", arbable_addrs.len(), total_pools);
+    let cross_dex_count = arbable_addrs.len();
+
+    // Include all WETH-connected pools (for triangular arb routes)
+    for addr in &weth_connected {
+        if seen.insert(*addr) { arbable_addrs.push(*addr); }
+    }
+
+    // Include pools where either token connects to a WETH pool (2-hop triangular)
+    let weth_tokens: std::collections::HashSet<alloy::primitives::Address> = weth_connected.iter()
+        .filter_map(|addr| discovery.pools.get(addr))
+        .flat_map(|p| {
+            let other = if p.token0 == weth { p.token1 } else { p.token0 };
+            std::iter::once(other)
+        })
+        .collect();
+    for entry in discovery.pools.iter() {
+        let p = entry.value();
+        if (weth_tokens.contains(&p.token0) || weth_tokens.contains(&p.token1))
+            && p.token0 != weth && p.token1 != weth
+        {
+            if seen.insert(p.address) { arbable_addrs.push(p.address); }
+        }
+    }
+
+    info!(
+        "Candidate pools: {} ({} cross-DEX, {} WETH-connected, {} bridging) from {} total",
+        arbable_addrs.len(), cross_dex_count, weth_connected.len(),
+        arbable_addrs.len() - cross_dex_count - weth_connected.len().min(arbable_addrs.len() - cross_dex_count),
+        total_pools
+    );
 
     // ============================================================
     // 5. Batched safety checks via multicall
@@ -181,6 +222,7 @@ async fn main() -> eyre::Result<()> {
     let arb_engine = arbitrage::ArbitrageEngine::new(rpc.clone());
     let mut backrun = backrun::BackrunDetector::new();
     let mut liq_monitor = liquidation::LiquidationMonitor::new(rpc.clone());
+    let mut oracle_monitor = oracle_arb::OracleArbMonitor::new(rpc.clone());
 
     // Discover Aave users for liquidation monitoring
     match liq_monitor.discover_users(50_000).await {
@@ -236,8 +278,10 @@ async fn main() -> eyre::Result<()> {
         while let Some(event) = rt_rx.recv().await {
             match &event {
                 websocket::ChainEvent::NewPool { pool } => {
-                    info!("RT: New pool {} on {}", pool.address, pool.dex_name);
+                    info!("RT: New pool {} on {} — hot arb candidate", pool.address, pool.dex_name);
                     discovery_pools_rt.insert(pool.address, pool.clone());
+                    // Forward new pool events for immediate arb scan
+                    let _ = backrun_tx.send(event.clone()).await;
                 }
                 websocket::ChainEvent::LargeSwap { pool, block, amount0, amount1, .. } => {
                     info!("RT: Large swap on {} block={} a0={:.4}ETH a1={:.4}ETH",
@@ -333,7 +377,7 @@ async fn main() -> eyre::Result<()> {
         let cycle_start = std::time::Instant::now();
 
         // Step 0a: Re-discover liquidation users every 7200 cycles (~4h)
-        if cycle % 7200 == 0 {
+        if cycle % 1800 == 0 {
             match liq_monitor.discover_users(20_000).await {
                 Ok(n) => info!("Refreshed liquidation tracking: {} users", n),
                 Err(e) => warn!("Liquidation refresh failed: {}", e),
@@ -342,21 +386,30 @@ async fn main() -> eyre::Result<()> {
 
         // Step 0b: Rebuild pair index every 500 cycles to pick up new RT pools
         if cycle % 500 == 0 {
-            let all_addrs: Vec<alloy::primitives::Address> = discovery.pools.iter()
-                .map(|e| *e.key())
-                .collect();
-            // Re-run safety filter on new pools
+            // Batch-check any new tokens discovered since last rebuild
+            let mut new_tokens: Vec<alloy::primitives::Address> = Vec::new();
+            {
+                let mut token_seen = std::collections::HashSet::new();
+                for entry in discovery.pools.iter() {
+                    let p = entry.value();
+                    if token_seen.insert(p.token0) { new_tokens.push(p.token0); }
+                    if token_seen.insert(p.token1) { new_tokens.push(p.token1); }
+                }
+            }
+            let _ = safety.batch_check_tokens(&new_tokens).await;
+
+            // Re-run safety filter on all pools
             let bl = blacklist.lock().await;
-            safe_pools = all_addrs.iter()
-                .filter(|addr| {
-                    if let Some(pool) = discovery.pools.get(*addr) {
-                        safety.check_pool_tokens_cached(pool.token0, pool.token1)
-                            && bl.is_pair_safe(&pool.token0, &pool.token1)
-                    } else {
-                        false
-                    }
+            safe_pools = discovery.pools.iter()
+                .filter(|entry| {
+                    let p = entry.value();
+                    // Include if: WETH-connected OR part of multi-pool pair
+                    let weth_connected = p.token0 == weth || p.token1 == weth;
+                    let safe = safety.check_pool_tokens_cached(p.token0, p.token1)
+                        && bl.is_pair_safe(&p.token0, &p.token1);
+                    safe && (weth_connected || true) // include all safe pools for triangular routing
                 })
-                .copied()
+                .map(|e| *e.key())
                 .collect();
             drop(bl);
             pair_index = arbitrage::PairIndex::build(&discovery.pools, &safe_pools, weth);
@@ -371,18 +424,38 @@ async fn main() -> eyre::Result<()> {
             gas_pred.sample().await;
         }
 
-        // Step 2: Smart refresh — stale pools only (full refresh every 20 cycles)
-        if cycle % 20 == 0 {
-            // Full refresh periodically to catch drift
+        // Step 2: Tiered refresh — only refresh what matters
+        if cycle % 100 == 0 {
+            // Full refresh: all safe pools (slow, every ~30s)
             arb_engine.refresh_reserves(&discovery.pools, &safe_pools).await;
+        } else if cycle % 5 == 0 {
+            // Priority refresh: arbable pairs + top 200 WETH pools
+            let mut priority_pools: Vec<alloy::primitives::Address> = Vec::new();
+            for pair_addrs in &pair_index.arbable_pairs {
+                priority_pools.extend(pair_addrs.iter());
+            }
+            priority_pools.extend(pair_index.weth_pools.iter().take(200));
+            priority_pools.sort_unstable();
+            priority_pools.dedup();
+            arb_engine.refresh_reserves(&discovery.pools, &priority_pools).await;
         } else {
-            // Only refresh pools with recent swaps + their pair partners
+            // Fast: only stale pools from WS events
             arb_engine.refresh_stale_only(&discovery.pools, &safe_pools, &stale_pools).await;
         }
         let refresh_elapsed = cycle_start.elapsed();
 
         // Step 3: Process backrun opportunities from large swaps
+        let mut backrun_opps = Vec::new();
+        let mut new_pool_detected = false;
         while let Ok(event) = backrun_rx.try_recv() {
+            if let websocket::ChainEvent::NewPool { pool: new_pool } = &event {
+                // New pool detected — add to safe_pools and trigger immediate index rebuild
+                if safety.check_pool_tokens_cached(new_pool.token0, new_pool.token1) {
+                    safe_pools.push(new_pool.address);
+                    new_pool_detected = true;
+                    info!("Hot pool added: {} ({}/{})", new_pool.address, new_pool.token0, new_pool.token1);
+                }
+            }
             if let websocket::ChainEvent::LargeSwap { pool, block, amount0, amount1, is_v3 } = event {
                 backrun.record_swap(pool, block, amount0, amount1, is_v3);
                 let br_opps = backrun.find_backrun_opportunities(
@@ -397,20 +470,61 @@ async fn main() -> eyre::Result<()> {
                         );
                         tokio::spawn(async move { telegram::send(&tg_msg).await; });
                     }
-                    // Will be merged with regular opps below
                 }
+                backrun_opps.extend(br_opps);
             }
+        }
+
+        // Instant rebuild if new pool detected (don't wait 500 cycles)
+        if new_pool_detected {
+            pair_index = arbitrage::PairIndex::build(&discovery.pools, &safe_pools, weth);
+            info!("Hot rebuild: {} arbable pairs, {} WETH pools", pair_index.arbable_pairs.len(), pair_index.weth_pools.len());
         }
 
         // Step 3b: Scan opportunities using cached reserves (pure CPU)
         let scan_start = std::time::Instant::now();
         let mut opps = arb_engine.find_opportunities_cached(&discovery.pools, &pair_index);
+        // Merge backrun opportunities into main pipeline
+        opps.extend(backrun_opps);
         let scan_elapsed = scan_start.elapsed();
 
-        // Step 4: Filter out blacklisted tokens
+        // Step 3c: Oracle-guided LST arb scan
+        if cycle % 50 == 0 {
+            oracle_monitor.refresh_oracle_rates().await;
+        }
+        // Refresh DEX prices for LST pools every 3 cycles (~600ms with 200ms sleep)
+        if cycle % 3 == 0 {
+            oracle_monitor.refresh_dex_prices().await;
+        }
+        let oracle_opps = oracle_monitor.find_oracle_arb_opportunities();
+        if !oracle_opps.is_empty() {
+            for opp in &oracle_opps {
+                info!(
+                    "ORACLE ARB: {} spread={:.4}% | buy={:.6} on {} | sell={:.6} on {} | oracle={:.6}",
+                    opp.name, opp.spread_pct, opp.buy_price, opp.buy_pool,
+                    opp.sell_price, opp.sell_pool, opp.oracle_rate
+                );
+            }
+        }
+
+        // Step 4: Filter out blacklisted tokens + verify all pools have safe tokens
         {
             let bl = blacklist.lock().await;
-            opps.retain(|opp| bl.is_pair_safe(&opp.token_in, &opp.token_bridge));
+            opps.retain(|opp| {
+                if !bl.is_pair_safe(&opp.token_in, &opp.token_bridge) { return false; }
+                // For triangular arbs, also check intermediate pools
+                match &opp.path {
+                    arbitrage::ArbPath::Triangular { pool1, pool2, pool3, .. } => {
+                        for pool_addr in [pool1, pool2, pool3] {
+                            if let Some(p) = discovery.pools.get(pool_addr) {
+                                if !bl.is_pair_safe(&p.token0, &p.token1) { return false; }
+                            }
+                        }
+                        true
+                    }
+                    _ => true,
+                }
+            });
         }
 
         // Step 5: Filter by gas profitability
@@ -563,19 +677,13 @@ async fn main() -> eyre::Result<()> {
             );
         }
 
-        // Adaptive sleep: shorter when opportunities found, longer when idle
+        // Adaptive sleep: match flashblock cadence (200ms)
         let sleep_ms = if !opps.is_empty() {
-            // Hot: found opps this cycle, check again ASAP
-            50
+            10  // Hot: found opps, re-scan immediately
         } else if stale_pools.len() > 0 {
-            // Warm: swaps happening but no arbs yet, check quickly
-            100
-        } else if elapsed.as_millis() < cfg.poll_interval_ms as u128 {
-            // Cold: no activity, use normal interval
-            cfg.poll_interval_ms
+            50  // Warm: swaps detected, check within flashblock
         } else {
-            // Cycle was slow (heavy refresh), minimal sleep
-            10
+            200 // Cold: wait one flashblock period
         };
         tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
     }

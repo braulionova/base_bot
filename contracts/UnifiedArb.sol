@@ -110,6 +110,58 @@ contract UnifiedArb {
     }
 
     // ================================================================
+    // KEEPER ENTRY POINTS (anyone can call, keeper gets 10% of profit)
+    // ================================================================
+
+    /// @notice Anyone can trigger a direct arb. Keeper (msg.sender) gets 10% of profit as gas reward.
+    function keeperDirect(
+        address tokenIn,
+        uint256 amountIn,
+        address poolA,
+        address poolB,
+        bool poolAisV3,
+        bool poolBisV3,
+        address tokenBridge
+    ) external {
+        uint256 balBefore = IERC20(tokenIn).balanceOf(address(this));
+        bytes memory params = abi.encode(
+            OP_DIRECT, poolA, poolB, poolAisV3, poolBisV3, tokenBridge,
+            address(0), address(0), false, address(0)
+        );
+        IPool(AAVE).flashLoanSimple(address(this), tokenIn, amountIn, params, 0);
+        // Pay keeper 10% of profit
+        uint256 profit = IERC20(tokenIn).balanceOf(address(this)) - balBefore;
+        if (profit > 0) {
+            IERC20(tokenIn).transfer(msg.sender, profit / 10);
+        }
+    }
+
+    /// @notice Anyone can trigger a triangular arb. Keeper gets 10% of profit.
+    function keeperTriangular(
+        uint256 amountIn,
+        address pool1,
+        address pool2,
+        address pool3,
+        bool pool1isV3,
+        bool pool2isV3,
+        bool pool3isV3,
+        address tokenA,
+        address tokenB
+    ) external {
+        address weth = 0x4200000000000000000000000000000000000006;
+        uint256 balBefore = IERC20(weth).balanceOf(address(this));
+        bytes memory params = abi.encode(
+            OP_TRIANGULAR, pool1, pool2, pool1isV3, pool2isV3, tokenA,
+            pool3, tokenB, pool3isV3, address(0)
+        );
+        IPool(AAVE).flashLoanSimple(address(this), weth, amountIn, params, 0);
+        uint256 profit = IERC20(weth).balanceOf(address(this)) - balBefore;
+        if (profit > 0) {
+            IERC20(weth).transfer(msg.sender, profit / 10);
+        }
+    }
+
+    // ================================================================
     // AAVE FLASH LOAN CALLBACK
     // ================================================================
 
@@ -127,8 +179,10 @@ contract UnifiedArb {
             address addr1, address addr2,
             bool flag1, bool flag2, address token1,
             address addr3, address token2, bool flag3,
-            address /* unused */
+            address _unused
         ) = abi.decode(params, (uint8, address, address, bool, bool, address, address, address, bool, address));
+
+        uint256 balBefore = IERC20(asset).balanceOf(address(this));
 
         if (opType == OP_DIRECT) {
             _execDirect(asset, amount, addr1, addr2, flag1, flag2, token1);
@@ -138,8 +192,13 @@ contract UnifiedArb {
             _execLiquidation(asset, amount, addr1, token1, addr3, addr2, flag1);
         }
 
+        // Profit guard: revert if we'd lose money (balance must cover repayment)
+        uint256 repay = amount + premium;
+        uint256 balAfter = IERC20(asset).balanceOf(address(this));
+        require(balAfter >= repay, "!profit");
+
         // Repay flash loan
-        IERC20(asset).approve(AAVE, amount + premium);
+        IERC20(asset).approve(AAVE, repay);
         return true;
     }
 
@@ -212,7 +271,7 @@ contract UnifiedArb {
     // ================================================================
 
     function _swapV3(address pool, address tIn, address tOut, uint256 amt) internal returns (uint256) {
-        IERC20(tIn).approve(pool, amt);
+        // No approve needed — tokens sent via callback (_v3Callback)
         bool zf = tIn < tOut;
         (int256 a0, int256 a1) = IV3(pool).swap(
             address(this), zf, int256(amt), zf ? MIN_S + 1 : MAX_S - 1,

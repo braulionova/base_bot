@@ -7,3 +7,7 @@ prioritized_routes.json
 *.log
 __pycache__/
 *.pkl
+.env
+blacklist.json
+pnl.json
+active_pools.json

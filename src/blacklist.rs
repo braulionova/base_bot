@@ -1,4 +1,4 @@
-use alloy::primitives::Address;
+use alloy::primitives::{Address, address};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -57,32 +57,55 @@ impl Default for TokenScore {
 
 impl TokenBlacklist {
     pub fn new(save_path: &str) -> Self {
-        Self {
+        let mut bl = Self {
             tokens: HashMap::new(),
-            threshold: 0.7, // 70% revert rate = blacklisted
+            threshold: 0.7,
             save_path: save_path.to_string(),
+        };
+        // Hard-blacklist known honeypot tokens using compile-time addresses
+        let honeypots: [Address; 4] = [
+            address!("8FcdC998c3A3Ccd8c076b7A4C04ba47fcCE1aEe4"), // ASWISS
+            address!("fB810D1A2ca396E5a8c0269337e3f998441b4D62"), // BTCSC
+            address!("c3c8707A8e6E0708777D566dFE8B0826EAd46C9f"), // unknown
+            address!("4317958100A9a28693fc0bB107E6944DAdb37f51"), // HP
+        ];
+        for addr in honeypots {
+            bl.tokens.insert(addr, TokenScore {
+                hard_blacklisted: true,
+                revert_rate: 1.0,
+                consecutive_reverts: 10,
+                attempts: 10,
+                reverts: 10,
+                ..Default::default()
+            });
         }
+        bl
     }
 
     /// Load from disk
     pub fn load(path: &str) -> Self {
+        let mut bl = Self::new(path); // always start with hardcoded honeypots
         let p = Path::new(path);
         if p.exists() {
-            match std::fs::read_to_string(p) {
-                Ok(data) => {
-                    match serde_json::from_str::<TokenBlacklist>(&data) {
-                        Ok(mut bl) => {
-                            bl.save_path = path.to_string();
-                            info!("Loaded blacklist: {} tokens tracked", bl.tokens.len());
-                            return bl;
-                        }
-                        Err(e) => warn!("Failed to parse blacklist: {}", e),
+            if let Ok(data) = std::fs::read_to_string(p) {
+                if let Ok(saved) = serde_json::from_str::<TokenBlacklist>(&data) {
+                    // Merge saved tokens into hardcoded base
+                    for (addr, score) in saved.tokens {
+                        let score_clone = score.clone();
+                        bl.tokens.entry(addr).and_modify(|existing| {
+                            if !existing.hard_blacklisted {
+                                *existing = score_clone;
+                            }
+                        }).or_insert(score);
                     }
+                    if saved.threshold > 0.0 { bl.threshold = saved.threshold; }
+                    info!("Loaded blacklist: {} tokens tracked ({} hardcoded honeypots)", bl.tokens.len(), 4);
+                    return bl;
                 }
-                Err(e) => warn!("Failed to read blacklist: {}", e),
             }
         }
-        Self::new(path)
+        info!("Loaded blacklist: {} tokens (hardcoded only)", bl.tokens.len());
+        bl
     }
 
     /// Save to disk

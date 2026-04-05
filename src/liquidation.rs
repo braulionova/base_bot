@@ -78,7 +78,7 @@ const MONITORED_ASSETS: &[(&str, &str)] = &[
 const HEALTH_FACTOR_THRESHOLD: u128 = 1_000_000_000_000_000_000; // 1.0
 
 /// Maximum users to track
-const MAX_TRACKED_USERS: usize = 500;
+const MAX_TRACKED_USERS: usize = 2000;
 
 #[derive(Debug, Clone)]
 pub struct LiquidationOpportunity {
