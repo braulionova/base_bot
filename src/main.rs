@@ -166,17 +166,19 @@ async fn main() -> eyre::Result<()> {
     // ============================================================
     // 6. Build pre-computed pair index
     // ============================================================
-    let pair_index = arbitrage::PairIndex::build(&discovery.pools, &safe_pools, weth);
+    let mut pair_index = arbitrage::PairIndex::build(&discovery.pools, &safe_pools, weth);
     info!(
         "Pair index: {} arbable pairs, {} WETH pools for triangular",
         pair_index.arbable_pairs.len(), pair_index.weth_pools.len()
     );
+    let mut safe_pools = safe_pools;
 
     // ============================================================
     // 7. Initialize arb engine and executor
     // ============================================================
     let arb_engine = arbitrage::ArbitrageEngine::new(rpc.clone());
     let mut executor = executor::Executor::new(rpc.clone(), cfg.wallet_address, dry_run);
+    executor.set_profit_params(cfg.gas_margin, cfg.min_net_profit_wei);
 
     if let Some(contract) = arb_contract {
         executor.set_arb_contract(contract);
@@ -209,6 +211,7 @@ async fn main() -> eyre::Result<()> {
     }
 
     let (rt_feed, mut rt_rx) = websocket::RealtimeFeed::new(rpc.clone(), monitored_pools.clone());
+    let stale_pools = rt_feed.stale_pools.clone();
     let factory_addrs: Vec<alloy::primitives::Address> = factories.iter().map(|f| f.factory).collect();
 
     tokio::spawn(async move {
@@ -306,13 +309,45 @@ async fn main() -> eyre::Result<()> {
         cycle += 1;
         let cycle_start = std::time::Instant::now();
 
+        // Step 0: Rebuild pair index every 500 cycles to pick up new RT pools
+        if cycle % 500 == 0 {
+            let all_addrs: Vec<alloy::primitives::Address> = discovery.pools.iter()
+                .map(|e| *e.key())
+                .collect();
+            // Re-run safety filter on new pools
+            let bl = blacklist.lock().await;
+            safe_pools = all_addrs.iter()
+                .filter(|addr| {
+                    if let Some(pool) = discovery.pools.get(*addr) {
+                        safety.check_pool_tokens_cached(pool.token0, pool.token1)
+                            && bl.is_pair_safe(&pool.token0, &pool.token1)
+                    } else {
+                        false
+                    }
+                })
+                .copied()
+                .collect();
+            drop(bl);
+            pair_index = arbitrage::PairIndex::build(&discovery.pools, &safe_pools, weth);
+            info!(
+                "Rebuilt pair index: {} pools, {} arbable pairs, {} WETH pools",
+                safe_pools.len(), pair_index.arbable_pairs.len(), pair_index.weth_pools.len()
+            );
+        }
+
         // Step 1: Sample gas price (every 10 cycles to reduce RPC)
         if cycle % 10 == 1 {
             gas_pred.sample().await;
         }
 
-        // Step 2: Batch refresh all reserves via multicall
-        arb_engine.refresh_reserves(&discovery.pools, &safe_pools).await;
+        // Step 2: Smart refresh — stale pools only (full refresh every 20 cycles)
+        if cycle % 20 == 0 {
+            // Full refresh periodically to catch drift
+            arb_engine.refresh_reserves(&discovery.pools, &safe_pools).await;
+        } else {
+            // Only refresh pools with recent swaps + their pair partners
+            arb_engine.refresh_stale_only(&discovery.pools, &safe_pools, &stale_pools).await;
+        }
         let refresh_elapsed = cycle_start.elapsed();
 
         // Step 3: Scan opportunities using cached reserves (pure CPU)
@@ -327,60 +362,75 @@ async fn main() -> eyre::Result<()> {
         }
 
         // Step 5: Filter by gas profitability
-        if gas_pred.is_gas_expensive() {
-            // During expensive gas, only keep high-profit opps
-            opps.retain(|opp| opp.profit_eth > 0.0001); // ~$0.25 min during high gas
-        }
+        // Dynamic floor: use gas predictor to estimate actual gas cost per opp type
+        opps.retain(|opp| {
+            let est_gas = match &opp.path {
+                arbitrage::ArbPath::Direct { .. } => 350_000u64,
+                arbitrage::ArbPath::Triangular { .. } => 500_000u64,
+            };
+            let (profitable, _) = gas_pred.net_profit_after_gas_dynamic(
+                opp.profit_wei, est_gas, cfg.gas_margin, cfg.min_net_profit_wei,
+            );
+            profitable
+        });
 
         total_opps += opps.len() as u64;
 
-        // Step 6: Simulate + Execute (up to 3 best opportunities per cycle)
-        for opp in opps.iter().take(3) {
-            telegram::send(&format!(
-                "🔍 *Arb Detected*\n\
-                 {} → {}\n\
-                 Profit: {:.6} ETH (~${:.2})\n\
-                 Amount: {:.4} ETH\n\
-                 Pool A: `{}`\n\
-                 Pool B: `{}`\n\
-                 Gas: {}",
-                opp.dex_a, opp.dex_b,
-                opp.profit_eth, opp.profit_eth * 2500.0,
-                arbitrage::wei_to_eth(opp.amount_in),
-                opp.pool_a, opp.pool_b,
-                if gas_pred.is_gas_cheap() { "CHEAP ✓" } else if gas_pred.is_gas_expensive() { "HIGH ⚠" } else { "normal" }
-            )).await;
+        // Step 6: Parallel simulate top 3, then execute best passing
+        let top_opps: Vec<_> = opps.iter().take(3).cloned().collect();
+        if !top_opps.is_empty() {
+            // Fire off Telegram notifications non-blocking
+            let gas_label = if gas_pred.is_gas_cheap() { "CHEAP ✓" } else if gas_pred.is_gas_expensive() { "HIGH ⚠" } else { "normal" };
+            for opp in &top_opps {
+                let tg_msg = format!(
+                    "🔍 *Arb Detected*\n{} → {} | {:.6} ETH | Gas: {}",
+                    opp.dex_a, opp.dex_b, opp.profit_eth, gas_label
+                );
+                tokio::spawn(async move { telegram::send(&tg_msg).await; });
+            }
 
-            match executor.simulate_arb(opp, &gas_pred, &discovery.pools).await {
-                Ok(true) => {
-                    telegram::send(&format!(
-                        "✅ *SIM PASSED* - Executing!\n\
-                         {} → {} | {:.6} ETH profit",
-                        opp.dex_a, opp.dex_b, opp.profit_eth
-                    )).await;
+            // Parallel simulation of all candidates
+            let mut sim_futures = Vec::new();
+            for opp in &top_opps {
+                sim_futures.push(executor.simulate_arb(opp, &gas_pred, &discovery.pools));
+            }
+            let sim_results = futures::future::join_all(sim_futures).await;
 
-                    match executor.execute_arb(opp, &gas_pred, &pnl_tracker, &blacklist, &discovery.pools).await {
-                        Ok(()) => {
-                            telegram::send(&format!(
-                                "⚡ *TX SENT*\n\
-                                 {} → {}\n\
-                                 Expected: {:.6} ETH (~${:.2})",
-                                opp.dex_a, opp.dex_b,
-                                opp.profit_eth, opp.profit_eth * 2500.0
-                            )).await;
-                        }
-                        Err(e) => {
-                            error!("Execution error: {}", e);
-                            telegram::send(&format!("❌ Exec error: {}", e)).await;
+            // Execute first passing sim (highest profit first since opps are sorted)
+            let mut executed = false;
+            for (opp, sim_result) in top_opps.iter().zip(sim_results.iter()) {
+                match sim_result {
+                    Ok(true) => {
+                        if !executed {
+                            let tg_msg = format!(
+                                "✅ *SIM PASSED* - Executing!\n{} → {} | {:.6} ETH",
+                                opp.dex_a, opp.dex_b, opp.profit_eth
+                            );
+                            tokio::spawn(async move { telegram::send(&tg_msg).await; });
+
+                            match executor.execute_arb(opp, &gas_pred, &pnl_tracker, &blacklist, &discovery.pools).await {
+                                Ok(()) => {
+                                    let tg_msg = format!(
+                                        "⚡ *TX SENT*\n{} → {} | {:.6} ETH",
+                                        opp.dex_a, opp.dex_b, opp.profit_eth
+                                    );
+                                    tokio::spawn(async move { telegram::send(&tg_msg).await; });
+                                    executed = true;
+                                }
+                                Err(e) => {
+                                    error!("Execution error: {}", e);
+                                    let tg_msg = format!("❌ Exec error: {}", e);
+                                    tokio::spawn(async move { telegram::send(&tg_msg).await; });
+                                }
+                            }
                         }
                     }
+                    Ok(false) => {
+                        let mut bl = blacklist.lock().await;
+                        bl.record_revert(opp.token_bridge, 350_000, 0);
+                    }
+                    Err(e) => warn!("Sim error: {}", e),
                 }
-                Ok(false) => {
-                    // Sim failed — might be blacklist-worthy
-                    let mut bl = blacklist.lock().await;
-                    bl.record_revert(opp.token_bridge, 350_000, 0);
-                }
-                Err(e) => warn!("Sim error: {}", e),
             }
         }
 
@@ -428,9 +478,20 @@ async fn main() -> eyre::Result<()> {
             );
         }
 
-        // Only sleep if cycle was fast
-        if elapsed.as_millis() < cfg.poll_interval_ms as u128 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(cfg.poll_interval_ms)).await;
-        }
+        // Adaptive sleep: shorter when opportunities found, longer when idle
+        let sleep_ms = if !opps.is_empty() {
+            // Hot: found opps this cycle, check again ASAP
+            50
+        } else if stale_pools.len() > 0 {
+            // Warm: swaps happening but no arbs yet, check quickly
+            100
+        } else if elapsed.as_millis() < cfg.poll_interval_ms as u128 {
+            // Cold: no activity, use normal interval
+            cfg.poll_interval_ms
+        } else {
+            // Cycle was slow (heavy refresh), minimal sleep
+            10
+        };
+        tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
     }
 }

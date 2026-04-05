@@ -54,7 +54,7 @@ pub struct V3State {
     pub liquidity: u128,
 }
 
-/// Batch fetch V2 reserves for multiple pools in a single RPC call.
+/// Batch fetch V2 reserves — all chunks run in parallel across RPC providers.
 pub async fn batch_v2_reserves(
     rpc: &Arc<MultiRpcProvider>,
     pools: &[Address],
@@ -63,48 +63,60 @@ pub async fn batch_v2_reserves(
         return vec![];
     }
 
-    let provider = rpc.get();
     let calldata = IReservesV2::getReservesCall {}.abi_encode();
 
-    let mut all_results: Vec<Option<V2Reserves>> = Vec::with_capacity(pools.len());
+    let chunks: Vec<&[Address]> = pools.chunks(200).collect();
+    let mut futures = Vec::with_capacity(chunks.len());
 
-    for chunk in pools.chunks(200) {
-        let calls: Vec<IMulticall3::Call3> = chunk.iter().map(|addr| {
-            IMulticall3::Call3 {
-                target: *addr,
-                allowFailure: true,
-                callData: Bytes::from(calldata.clone()),
-            }
-        }).collect();
+    for chunk in &chunks {
+        let provider = rpc.get(); // round-robin across providers
+        let cd = calldata.clone();
+        let addrs = chunk.to_vec();
 
-        let mc = IMulticall3::new(MULTICALL3, provider);
-        match mc.aggregate3(calls).call().await {
-            Ok(ret) => {
-                // aggregate3 returns Vec<McResult> directly (single return val)
-                for res in ret.iter() {
-                    if res.success && res.returnData.len() >= 64 {
-                        if let Ok(decoded) = IReservesV2::getReservesCall::abi_decode_returns(&res.returnData) {
-                            all_results.push(Some(V2Reserves {
-                                reserve0: U256::from(decoded.reserve0),
-                                reserve1: U256::from(decoded.reserve1),
-                            }));
-                            continue;
+        futures.push(async move {
+            let calls: Vec<IMulticall3::Call3> = addrs.iter().map(|addr| {
+                IMulticall3::Call3 {
+                    target: *addr,
+                    allowFailure: true,
+                    callData: Bytes::from(cd.clone()),
+                }
+            }).collect();
+
+            let mc = IMulticall3::new(MULTICALL3, provider);
+            match mc.aggregate3(calls).call().await {
+                Ok(ret) => {
+                    let mut results = Vec::with_capacity(addrs.len());
+                    for res in ret.iter() {
+                        if res.success && res.returnData.len() >= 64 {
+                            if let Ok(decoded) = IReservesV2::getReservesCall::abi_decode_returns(&res.returnData) {
+                                results.push(Some(V2Reserves {
+                                    reserve0: U256::from(decoded.reserve0),
+                                    reserve1: U256::from(decoded.reserve1),
+                                }));
+                                continue;
+                            }
                         }
+                        results.push(None);
                     }
-                    all_results.push(None);
+                    results
+                }
+                Err(e) => {
+                    warn!("Multicall V2 reserves failed: {}", e);
+                    vec![None; addrs.len()]
                 }
             }
-            Err(e) => {
-                warn!("Multicall V2 reserves failed: {}", e);
-                all_results.extend(chunk.iter().map(|_| None));
-            }
-        }
+        });
     }
 
+    let chunk_results = futures::future::join_all(futures).await;
+    let mut all_results = Vec::with_capacity(pools.len());
+    for chunk_res in chunk_results {
+        all_results.extend(chunk_res);
+    }
     all_results
 }
 
-/// Batch fetch V3 state (slot0 + liquidity) for multiple pools.
+/// Batch fetch V3 state (slot0 + liquidity) — all chunks run in parallel.
 pub async fn batch_v3_state(
     rpc: &Arc<MultiRpcProvider>,
     pools: &[Address],
@@ -113,57 +125,71 @@ pub async fn batch_v3_state(
         return vec![];
     }
 
-    let provider = rpc.get();
     let slot0_cd = ISlot0V3::slot0Call {}.abi_encode();
     let liq_cd = ISlot0V3::liquidityCall {}.abi_encode();
 
-    let mut all_results: Vec<Option<V3State>> = Vec::with_capacity(pools.len());
+    let chunks: Vec<&[Address]> = pools.chunks(100).collect();
+    let mut futures = Vec::with_capacity(chunks.len());
 
-    for chunk in pools.chunks(100) {
-        let mut calls: Vec<IMulticall3::Call3> = Vec::with_capacity(chunk.len() * 2);
-        for addr in chunk {
-            calls.push(IMulticall3::Call3 {
-                target: *addr,
-                allowFailure: true,
-                callData: Bytes::from(slot0_cd.clone()),
-            });
-            calls.push(IMulticall3::Call3 {
-                target: *addr,
-                allowFailure: true,
-                callData: Bytes::from(liq_cd.clone()),
-            });
-        }
+    for chunk in &chunks {
+        let provider = rpc.get();
+        let s_cd = slot0_cd.clone();
+        let l_cd = liq_cd.clone();
+        let addrs = chunk.to_vec();
 
-        let mc = IMulticall3::new(MULTICALL3, provider);
-        match mc.aggregate3(calls).call().await {
-            Ok(ret) => {
-                let results = &ret;
-                for i in (0..results.len()).step_by(2) {
-                    if i + 1 < results.len() && results[i].success && results[i + 1].success {
-                        let slot0_ok = ISlot0V3::slot0Call::abi_decode_returns(&results[i].returnData);
-                        let liq_ok = ISlot0V3::liquidityCall::abi_decode_returns(&results[i + 1].returnData);
-                        if let (Ok(s), Ok(l)) = (slot0_ok, liq_ok) {
-                            all_results.push(Some(V3State {
-                                sqrt_price_x96: U256::from(s.sqrtPriceX96),
-                                liquidity: l,
-                            }));
-                            continue;
+        futures.push(async move {
+            let mut calls: Vec<IMulticall3::Call3> = Vec::with_capacity(addrs.len() * 2);
+            for addr in &addrs {
+                calls.push(IMulticall3::Call3 {
+                    target: *addr,
+                    allowFailure: true,
+                    callData: Bytes::from(s_cd.clone()),
+                });
+                calls.push(IMulticall3::Call3 {
+                    target: *addr,
+                    allowFailure: true,
+                    callData: Bytes::from(l_cd.clone()),
+                });
+            }
+
+            let mc = IMulticall3::new(MULTICALL3, provider);
+            match mc.aggregate3(calls).call().await {
+                Ok(ret) => {
+                    let results = &ret;
+                    let mut parsed = Vec::with_capacity(addrs.len());
+                    for i in (0..results.len()).step_by(2) {
+                        if i + 1 < results.len() && results[i].success && results[i + 1].success {
+                            let slot0_ok = ISlot0V3::slot0Call::abi_decode_returns(&results[i].returnData);
+                            let liq_ok = ISlot0V3::liquidityCall::abi_decode_returns(&results[i + 1].returnData);
+                            if let (Ok(s), Ok(l)) = (slot0_ok, liq_ok) {
+                                parsed.push(Some(V3State {
+                                    sqrt_price_x96: U256::from(s.sqrtPriceX96),
+                                    liquidity: l,
+                                }));
+                                continue;
+                            }
                         }
+                        parsed.push(None);
                     }
-                    all_results.push(None);
+                    parsed
+                }
+                Err(e) => {
+                    warn!("Multicall V3 state failed: {}", e);
+                    vec![None; addrs.len()]
                 }
             }
-            Err(e) => {
-                warn!("Multicall V3 state failed: {}", e);
-                all_results.extend(chunk.iter().map(|_| None));
-            }
-        }
+        });
     }
 
+    let chunk_results = futures::future::join_all(futures).await;
+    let mut all_results = Vec::with_capacity(pools.len());
+    for chunk_res in chunk_results {
+        all_results.extend(chunk_res);
+    }
     all_results
 }
 
-/// Batch safety check: fetch totalSupply + decimals for tokens
+/// Batch safety check: fetch totalSupply + decimals for tokens — parallel chunks.
 pub async fn batch_token_info(
     rpc: &Arc<MultiRpcProvider>,
     tokens: &[Address],
@@ -179,54 +205,68 @@ pub async fn batch_token_info(
         }
     }
 
-    let provider = rpc.get();
     let supply_cd = IERC20Check::totalSupplyCall {}.abi_encode();
     let dec_cd = IERC20Check::decimalsCall {}.abi_encode();
 
-    let mut all_results: Vec<Option<(U256, u8)>> = Vec::with_capacity(tokens.len());
+    let chunks: Vec<&[Address]> = tokens.chunks(150).collect();
+    let mut futures = Vec::with_capacity(chunks.len());
 
-    for chunk in tokens.chunks(150) {
-        let mut calls: Vec<IMulticall3::Call3> = Vec::with_capacity(chunk.len() * 2);
-        for addr in chunk {
-            calls.push(IMulticall3::Call3 {
-                target: *addr,
-                allowFailure: true,
-                callData: Bytes::from(supply_cd.clone()),
-            });
-            calls.push(IMulticall3::Call3 {
-                target: *addr,
-                allowFailure: true,
-                callData: Bytes::from(dec_cd.clone()),
-            });
-        }
+    for chunk in &chunks {
+        let provider = rpc.get();
+        let s_cd = supply_cd.clone();
+        let d_cd = dec_cd.clone();
+        let addrs = chunk.to_vec();
 
-        let mc = IMulticall3::new(MULTICALL3, provider);
-        match mc.aggregate3(calls).call().await {
-            Ok(ret) => {
-                let results = &ret;
-                for i in (0..results.len()).step_by(2) {
-                    if i + 1 < results.len() && results[i].success {
-                        let supply_ok = IERC20Check::totalSupplyCall::abi_decode_returns(&results[i].returnData);
-                        let dec: u8 = if results[i + 1].success {
-                            IERC20Check::decimalsCall::abi_decode_returns(&results[i + 1].returnData)
-                                .unwrap_or(18)
-                        } else {
-                            18
-                        };
-                        if let Ok(supply) = supply_ok {
-                            all_results.push(Some((supply, dec)));
-                            continue;
+        futures.push(async move {
+            let mut calls: Vec<IMulticall3::Call3> = Vec::with_capacity(addrs.len() * 2);
+            for addr in &addrs {
+                calls.push(IMulticall3::Call3 {
+                    target: *addr,
+                    allowFailure: true,
+                    callData: Bytes::from(s_cd.clone()),
+                });
+                calls.push(IMulticall3::Call3 {
+                    target: *addr,
+                    allowFailure: true,
+                    callData: Bytes::from(d_cd.clone()),
+                });
+            }
+
+            let mc = IMulticall3::new(MULTICALL3, provider);
+            match mc.aggregate3(calls).call().await {
+                Ok(ret) => {
+                    let results = &ret;
+                    let mut parsed = Vec::with_capacity(addrs.len());
+                    for i in (0..results.len()).step_by(2) {
+                        if i + 1 < results.len() && results[i].success {
+                            let supply_ok = IERC20Check::totalSupplyCall::abi_decode_returns(&results[i].returnData);
+                            let dec: u8 = if results[i + 1].success {
+                                IERC20Check::decimalsCall::abi_decode_returns(&results[i + 1].returnData)
+                                    .unwrap_or(18)
+                            } else {
+                                18
+                            };
+                            if let Ok(supply) = supply_ok {
+                                parsed.push(Some((supply, dec)));
+                                continue;
+                            }
                         }
+                        parsed.push(None);
                     }
-                    all_results.push(None);
+                    parsed
+                }
+                Err(e) => {
+                    warn!("Multicall token info failed: {}", e);
+                    vec![None; addrs.len()]
                 }
             }
-            Err(e) => {
-                warn!("Multicall token info failed: {}", e);
-                all_results.extend(chunk.iter().map(|_| None));
-            }
-        }
+        });
     }
 
+    let chunk_results = futures::future::join_all(futures).await;
+    let mut all_results = Vec::with_capacity(tokens.len());
+    for chunk_res in chunk_results {
+        all_results.extend(chunk_res);
+    }
     all_results
 }

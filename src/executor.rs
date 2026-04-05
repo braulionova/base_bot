@@ -97,6 +97,10 @@ pub struct Executor {
     total_profit: AtomicU64,
     /// Maximum concurrent pending transactions
     max_pending: usize,
+    /// Gas margin multiplier for profit check
+    gas_margin: f64,
+    /// Absolute minimum net profit floor (wei)
+    min_net_profit_wei: u128,
 }
 
 impl Executor {
@@ -112,7 +116,14 @@ impl Executor {
             total_successes: AtomicU64::new(0),
             total_profit: AtomicU64::new(0),
             max_pending: 4, // max 4 concurrent txs
+            gas_margin: 1.5,
+            min_net_profit_wei: 10_000_000_000_000, // 0.00001 ETH
         }
+    }
+
+    pub fn set_profit_params(&mut self, gas_margin: f64, min_net_profit_wei: u128) {
+        self.gas_margin = gas_margin;
+        self.min_net_profit_wei = min_net_profit_wei;
     }
 
     pub fn init_signer(&mut self, private_key: &str, rpc_url: &str) -> Result<()> {
@@ -155,8 +166,10 @@ impl Executor {
             ArbPath::Triangular { .. } => 500_000u64,
         };
 
-        // Use gas predictor for accurate cost estimation
-        let (profitable, net_profit) = gas_predictor.net_profit_after_gas(opp.profit_wei, estimated_gas);
+        // Use gas predictor with dynamic margin for accurate cost estimation
+        let (profitable, net_profit) = gas_predictor.net_profit_after_gas_dynamic(
+            opp.profit_wei, estimated_gas, self.gas_margin, self.min_net_profit_wei,
+        );
         if !profitable {
             return Ok(false);
         }
@@ -182,6 +195,15 @@ impl Executor {
                     return Ok(false);
                 }
             }
+        }
+
+        // In dry run mode without contract, pass gas-profitable opps for logging
+        if self.dry_run {
+            info!(
+                "SIM (dry): {} -> {} | net {:.6} ETH (gas check passed)",
+                opp.dex_a, opp.dex_b, wei_to_eth(net_profit)
+            );
+            return Ok(true);
         }
 
         Ok(false)
@@ -228,6 +250,7 @@ impl Executor {
 
         // Use gas predictor for optimal gas price
         let gas_price = gas_predictor.gas_for_urgency(0.7); // slightly aggressive
+        let (base_fee, priority_tip) = gas_predictor.optimal_gas();
 
         let nonce = self.nonce_mgr.next().await;
 
@@ -235,7 +258,9 @@ impl Executor {
             .to(contract_addr)
             .input(calldata.into())
             .gas_limit(estimated_gas)
-            .nonce(nonce);
+            .nonce(nonce)
+            .max_fee_per_gas(base_fee + priority_tip)
+            .max_priority_fee_per_gas(priority_tip);
 
         info!(
             "EXEC: {} -> {} | {:.6} ETH in | nonce {} | gas {:.2}gwei",
@@ -301,7 +326,9 @@ impl Executor {
                         self.nonce_mgr.confirm(nonce).await;
                     }
                     Err(_) => {
-                        info!("TX pending: {:?} nonce={}", tx_hash, nonce);
+                        // Timeout — confirm nonce to prevent leak, it will land eventually
+                        self.nonce_mgr.confirm(nonce).await;
+                        info!("TX pending (timeout): {:?} nonce={}", tx_hash, nonce);
                     }
                 }
             }

@@ -2594,6 +2594,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "eyre",
+ "futures",
  "rand 0.8.5",
  "reqwest 0.12.28",
  "serde",

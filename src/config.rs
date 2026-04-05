@@ -11,6 +11,10 @@ pub struct Config {
     pub max_pools: usize,
     pub competition_threshold: u64,
     pub pool_cache_path: String,
+    /// Minimum net profit after gas (wei). Below this, skip even if gross positive.
+    pub min_net_profit_wei: u128,
+    /// Gas buffer multiplier (1.2 = require 20% margin over gas cost)
+    pub gas_margin: f64,
 }
 
 impl Config {
@@ -18,12 +22,13 @@ impl Config {
         Self {
             wallet_address: Address::from_str("0xd69f9856a569b1655b43b0395b7c2923a217cfe0").unwrap(),
             rpc_urls: vec![
-                "https://mainnet.base.org".into(),
-                "https://base.meowrpc.com".into(),
-                "https://base.publicnode.com".into(),
-                "https://base.drpc.org".into(),
-                "https://base-mainnet.public.blastapi.io".into(),
-                "https://base-rpc.publicnode.com".into(),
+                // Sorted by latency from us-east-1 (colocation)
+                "https://gateway.tenderly.co/public/base".into(),   // ~47ms GCP anycast
+                "https://base.drpc.org".into(),                      // ~50ms Cloudflare IAD
+                "https://base-mainnet.public.blastapi.io".into(),    // ~57ms Cloudflare IAD
+                "https://base-rpc.publicnode.com".into(),            // ~63ms Cloudflare IAD
+                "https://mainnet.base.org".into(),                   // ~65ms Coinbase official
+                "https://base.publicnode.com".into(),                // ~67ms fallback
             ],
             chain_id: 8453,
             min_profit_wei: 20_000_000_000_000, // 0.00002 ETH = ~$0.05 target
@@ -32,6 +37,9 @@ impl Config {
             max_pools: 50_000,
             competition_threshold: 3,
             pool_cache_path: "pools_cache.json".into(),
+            // Dynamic profit floor: net profit must exceed gas cost * margin
+            min_net_profit_wei: 10_000_000_000_000, // 0.00001 ETH = ~$0.025 absolute floor
+            gas_margin: 1.5, // require 50% margin over gas (was 20% hardcoded)
         }
     }
 }

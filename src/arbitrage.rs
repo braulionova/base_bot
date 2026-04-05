@@ -130,8 +130,7 @@ impl ArbitrageEngine {
         }
     }
 
-    /// Refresh all reserves via multicall in 1-2 RPC calls.
-    /// This replaces hundreds of individual getReserves/slot0 calls.
+    /// Refresh reserves via parallel multicall across all RPC providers.
     pub async fn refresh_reserves(&self, pools: &DashMap<Address, Pool>, addrs: &[Address]) {
         let mut v2_addrs = Vec::new();
         let mut v3_addrs = Vec::new();
@@ -145,7 +144,7 @@ impl ArbitrageEngine {
             }
         }
 
-        // Fetch V2 and V3 reserves concurrently
+        // Fetch V2 and V3 reserves concurrently (chunks parallelized inside)
         let (v2_results, v3_results) = tokio::join!(
             multicall::batch_v2_reserves(&self.rpc, &v2_addrs),
             multicall::batch_v3_state(&self.rpc, &v3_addrs),
@@ -168,6 +167,52 @@ impl ArbitrageEngine {
                 });
             }
         }
+    }
+
+    /// Priority refresh: only refresh stale pools (those with recent swaps).
+    /// Falls back to full refresh every N cycles.
+    pub async fn refresh_stale_only(
+        &self,
+        pools: &DashMap<Address, Pool>,
+        all_addrs: &[Address],
+        stale: &dashmap::DashMap<Address, ()>,
+    ) {
+        // Drain stale set
+        let stale_addrs: Vec<Address> = stale.iter().map(|e| *e.key()).collect();
+        stale.clear();
+
+        if stale_addrs.is_empty() {
+            // No swaps detected — skip refresh entirely (use cached data)
+            return;
+        }
+
+        // Only refresh pools that had swaps + their pair partners
+        let mut to_refresh: Vec<Address> = Vec::with_capacity(stale_addrs.len() * 3);
+        let mut seen = std::collections::HashSet::new();
+
+        for addr in &stale_addrs {
+            if seen.insert(*addr) {
+                to_refresh.push(*addr);
+            }
+        }
+
+        // Also refresh related pools (same token pair on other DEXes)
+        for addr in &stale_addrs {
+            if let Some(pool) = pools.get(addr) {
+                let key = sorted_pair(pool.token0, pool.token1);
+                for a in all_addrs {
+                    if seen.contains(a) { continue; }
+                    if let Some(p) = pools.get(a) {
+                        if sorted_pair(p.token0, p.token1) == key {
+                            seen.insert(*a);
+                            to_refresh.push(*a);
+                        }
+                    }
+                }
+            }
+        }
+
+        self.refresh_reserves(pools, &to_refresh).await;
     }
 
     /// Find opportunities using pre-computed index and cached reserves (zero RPC in hot path)
@@ -195,7 +240,7 @@ impl ArbitrageEngine {
                     }
 
                     if let Some(opp) = self.check_pair_arb_cached(&pool_a, &pool_b) {
-                        if opp.profit_eth > 0.00002 {
+                        if opp.profit_eth > 0.000005 {
                             opportunities.push(opp);
                         }
                     }
@@ -230,7 +275,7 @@ impl ArbitrageEngine {
                             if let Some(opp) = self.check_triangle_cached(
                                 &pool1, &pool2, &pool3, token_a, token_b,
                             ) {
-                                if opp.profit_eth > 0.00002 {
+                                if opp.profit_eth > 0.000005 {
                                     opportunities.push(opp);
                                 }
                             }
@@ -393,39 +438,50 @@ fn get_output_cached(
 ) -> Option<U256> {
     match state {
         PoolState::V2 { reserve0, reserve1 } => {
-            let (res_in, res_out) = if token_in < pool.token1 {
+            let (res_in, res_out) = if token_in == pool.token0 {
                 (*reserve0, *reserve1)
             } else {
                 (*reserve1, *reserve0)
             };
             if res_in.is_zero() || res_out.is_zero() { return None; }
-            // amountOut = (amountIn * 997 * reserveOut) / (reserveIn * 1000 + amountIn * 997)
-            let fee_amount = amount_in * U256::from(997);
-            let num = fee_amount * res_out;
-            let den = res_in * U256::from(1000) + fee_amount;
+            // Use pool.fee (millionths) instead of hardcoded 0.3%
+            let fee_factor = U256::from(1_000_000u32 - pool.fee);
+            let amount_after_fee = amount_in * fee_factor;
+            let num = amount_after_fee * res_out;
+            let den = res_in * U256::from(1_000_000u32) + amount_after_fee;
             if den.is_zero() { return None; }
             Some(num / den)
         }
         PoolState::V3 { sqrt_price_x96, liquidity } => {
             if *liquidity == 0 || sqrt_price_x96.is_zero() { return None; }
-            let zero_for_one = token_in < _token_out;
-            let price_x96 = *sqrt_price_x96;
-            let q96 = U256::from(1u128 << 96);
 
-            let amount_out = if zero_for_one {
-                let price_num = price_x96 * price_x96;
-                let price_denom = q96 * q96;
-                if price_denom.is_zero() { return None; }
-                let raw_out = amount_in * price_num / price_denom;
-                raw_out * U256::from(1_000_000u32 - pool.fee) / U256::from(1_000_000u32)
+            // Derive virtual reserves from sqrtPriceX96 and liquidity
+            // x (token0) = L * Q96 / sqrtPrice
+            // y (token1) = L * sqrtPrice / Q96
+            // Then apply constant product with fee for accurate single-tick pricing
+            let liq = U256::from(*liquidity);
+            let q96 = U256::from(1u128 << 96);
+            let sp = *sqrt_price_x96;
+
+            let virtual_reserve0 = liq * q96 / sp;
+            let virtual_reserve1 = liq * sp / q96;
+
+            if virtual_reserve0.is_zero() || virtual_reserve1.is_zero() { return None; }
+
+            let zero_for_one = token_in == pool.token0;
+            let (res_in, res_out) = if zero_for_one {
+                (virtual_reserve0, virtual_reserve1)
             } else {
-                let price_num = q96 * q96;
-                let price_denom = price_x96 * price_x96;
-                if price_denom.is_zero() { return None; }
-                let raw_out = amount_in * price_num / price_denom;
-                raw_out * U256::from(1_000_000u32 - pool.fee) / U256::from(1_000_000u32)
+                (virtual_reserve1, virtual_reserve0)
             };
-            Some(amount_out)
+
+            // Apply fee (pool.fee in millionths, e.g., 3000 = 0.3%)
+            let fee_factor = U256::from(1_000_000u32 - pool.fee);
+            let amount_after_fee = amount_in * fee_factor;
+            let num = amount_after_fee * res_out;
+            let den = res_in * U256::from(1_000_000u32) + amount_after_fee;
+            if den.is_zero() { return None; }
+            Some(num / den)
         }
         PoolState::Unknown => None,
     }

@@ -107,19 +107,46 @@ impl GasPredictor {
 
     /// Check if gas price should be applied to this arb.
     /// Returns adjusted profit after gas cost.
-    pub fn net_profit_after_gas(&self, gross_profit_wei: U256, estimated_gas_units: u64) -> (bool, U256) {
+    /// `gas_margin` = multiplier on gas cost as safety margin (e.g., 1.5 = need 50% over gas).
+    /// `min_net_wei` = absolute minimum net profit floor.
+    pub fn net_profit_after_gas_dynamic(
+        &self,
+        gross_profit_wei: U256,
+        estimated_gas_units: u64,
+        gas_margin: f64,
+        min_net_wei: u128,
+    ) -> (bool, U256) {
         let (base, tip) = self.optimal_gas();
         let gas_price = base + tip;
         let gas_cost = U256::from(gas_price) * U256::from(estimated_gas_units);
 
-        if gross_profit_wei > gas_cost {
-            let net = gross_profit_wei - gas_cost;
-            // Only execute if net profit is at least 20% of gas cost (margin of safety)
-            let min_margin = gas_cost / U256::from(5);
-            (net > min_margin, net)
-        } else {
-            (false, U256::ZERO)
+        if gross_profit_wei <= gas_cost {
+            return (false, U256::ZERO);
         }
+
+        let net = gross_profit_wei - gas_cost;
+
+        // Dynamic margin: scale with gas conditions
+        // When gas is cheap, accept tighter margins; when expensive, require more
+        let effective_margin = if self.is_gas_cheap() {
+            (gas_margin * 0.7).max(1.1) // relax margin in cheap gas
+        } else if self.is_gas_expensive() {
+            gas_margin * 1.5 // tighten margin in expensive gas
+        } else {
+            gas_margin
+        };
+
+        // Net profit must exceed: gas_cost * (margin - 1) AND absolute floor
+        let min_over_gas = U256::from((gas_cost.to::<u128>() as f64 * (effective_margin - 1.0)) as u128);
+        let min_floor = U256::from(min_net_wei);
+
+        let threshold = if min_over_gas > min_floor { min_over_gas } else { min_floor };
+        (net > threshold, net)
+    }
+
+    /// Legacy: fixed 20% margin (backwards compat)
+    pub fn net_profit_after_gas(&self, gross_profit_wei: U256, estimated_gas_units: u64) -> (bool, U256) {
+        self.net_profit_after_gas_dynamic(gross_profit_wei, estimated_gas_units, 1.2, 0)
     }
 
     /// Is gas currently "cheap" relative to historical? Good time to execute marginal arbs.

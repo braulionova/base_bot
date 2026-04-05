@@ -20,12 +20,15 @@ pub enum ChainEvent {
     NewPool { pool: Pool },
 }
 
-/// Real-time chain event feed via polling (upgradeable to WS)
-/// Monitors newHeads + swap logs on priority pools
+/// Real-time chain event feed via aggressive polling.
+/// Monitors newHeads + swap logs on priority pools.
+/// Tracks which pools had recent swaps for priority refresh.
 pub struct RealtimeFeed {
     rpc: Arc<MultiRpcProvider>,
     monitored_pools: Arc<DashMap<Address, Pool>>,
     tx: mpsc::Sender<ChainEvent>,
+    /// Pools with swaps since last refresh — used by main loop for priority refresh
+    pub stale_pools: Arc<DashMap<Address, ()>>,
 }
 
 // Swap event signatures
@@ -41,12 +44,14 @@ impl RealtimeFeed {
         rpc: Arc<MultiRpcProvider>,
         monitored_pools: Arc<DashMap<Address, Pool>>,
     ) -> (Self, mpsc::Receiver<ChainEvent>) {
-        let (tx, rx) = mpsc::channel(1000);
-        (Self { rpc, monitored_pools, tx }, rx)
+        let (tx, rx) = mpsc::channel(2000);
+        let stale_pools = Arc::new(DashMap::new());
+        (Self { rpc, monitored_pools, tx, stale_pools }, rx)
     }
 
-    /// Run the real-time feed loop. Polls every ~1s for new blocks + swap events.
-    /// With a local node at colocation, this gives ~1s latency.
+    /// Run the real-time feed loop.
+    /// Polls every 200ms for new blocks + swap events.
+    /// Swap detection feeds into stale_pools for priority refresh.
     pub async fn run(&self, factory_addresses: Vec<Address>) {
         let provider = self.rpc.get();
         let mut last_block = match provider.get_block_number().await {
@@ -57,7 +62,7 @@ impl RealtimeFeed {
             }
         };
 
-        info!("RealtimeFeed started at block {}", last_block);
+        info!("RealtimeFeed started at block {} (200ms polling)", last_block);
 
         let v3_swap: FixedBytes<32> = V3_SWAP_SIG.parse().unwrap();
         let v2_swap: FixedBytes<32> = V2_SWAP_SIG.parse().unwrap();
@@ -65,7 +70,7 @@ impl RealtimeFeed {
         let v2_created: FixedBytes<32> = V2_PAIR_CREATED.parse().unwrap();
 
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
             let provider = self.rpc.get();
             let current_block = match provider.get_block_number().await {
@@ -85,9 +90,8 @@ impl RealtimeFeed {
                 .map(|e| *e.key())
                 .collect();
 
-            // Batch: fetch swap events on all monitored pools
+            // Fetch swap events — V2 and V3 in parallel
             if !pool_addrs.is_empty() {
-                // Split V2 and V3 pools
                 let mut v2_addrs = Vec::new();
                 let mut v3_addrs = Vec::new();
                 for addr in &pool_addrs {
@@ -99,112 +103,145 @@ impl RealtimeFeed {
                     }
                 }
 
-                // V3 swaps
-                if !v3_addrs.is_empty() {
-                    for chunk in v3_addrs.chunks(50) {
-                        let filter = Filter::new()
-                            .address(chunk.to_vec())
-                            .event_signature(v3_swap)
-                            .from_block(last_block + 1)
-                            .to_block(current_block);
+                // Launch V2 and V3 swap queries in parallel
+                let from = last_block + 1;
+                let to = current_block;
 
-                        if let Ok(logs) = provider.get_logs(&filter).await {
-                            for log in &logs {
-                                let _ = self.tx.send(ChainEvent::SwapDetected {
-                                    pool: log.address(),
-                                }).await;
+                let v3_fut = {
+                    let provider = self.rpc.get();
+                    let addrs = v3_addrs.clone();
+                    let sig = v3_swap;
+                    async move {
+                        let mut swaps = Vec::new();
+                        for chunk in addrs.chunks(100) {
+                            let filter = Filter::new()
+                                .address(chunk.to_vec())
+                                .event_signature(sig)
+                                .from_block(from)
+                                .to_block(to);
+                            if let Ok(logs) = provider.get_logs(&filter).await {
+                                for log in &logs {
+                                    swaps.push(log.address());
+                                }
                             }
                         }
+                        swaps
                     }
-                }
+                };
 
-                // V2 swaps
-                if !v2_addrs.is_empty() {
-                    for chunk in v2_addrs.chunks(50) {
-                        let filter = Filter::new()
-                            .address(chunk.to_vec())
-                            .event_signature(v2_swap)
-                            .from_block(last_block + 1)
-                            .to_block(current_block);
-
-                        if let Ok(logs) = provider.get_logs(&filter).await {
-                            for log in &logs {
-                                let _ = self.tx.send(ChainEvent::SwapDetected {
-                                    pool: log.address(),
-                                }).await;
+                let v2_fut = {
+                    let provider = self.rpc.get();
+                    let addrs = v2_addrs.clone();
+                    let sig = v2_swap;
+                    async move {
+                        let mut swaps = Vec::new();
+                        for chunk in addrs.chunks(100) {
+                            let filter = Filter::new()
+                                .address(chunk.to_vec())
+                                .event_signature(sig)
+                                .from_block(from)
+                                .to_block(to);
+                            if let Ok(logs) = provider.get_logs(&filter).await {
+                                for log in &logs {
+                                    swaps.push(log.address());
+                                }
                             }
                         }
+                        swaps
                     }
+                };
+
+                let (v3_swaps, v2_swaps) = tokio::join!(v3_fut, v2_fut);
+
+                // Mark swapped pools as stale for priority refresh
+                for addr in v3_swaps.iter().chain(v2_swaps.iter()) {
+                    self.stale_pools.insert(*addr, ());
+                    let _ = self.tx.send(ChainEvent::SwapDetected { pool: *addr }).await;
                 }
             }
 
-            // Check for new pool creation events
+            // Check for new pool creation events — parallel V2+V3
             if !factory_addresses.is_empty() {
-                // V3 factory events
-                let filter_v3 = Filter::new()
-                    .address(factory_addresses.clone())
-                    .event_signature(v3_created)
-                    .from_block(last_block + 1)
-                    .to_block(current_block);
+                let from = last_block + 1;
+                let to = current_block;
 
-                if let Ok(logs) = provider.get_logs(&filter_v3).await {
-                    for log in &logs {
-                        if log.topics().len() >= 4 && log.data().data.len() >= 64 {
-                            let token0 = Address::from_word(log.topics()[1]);
-                            let token1 = Address::from_word(log.topics()[2]);
-                            let fee_bytes = log.topics()[3];
-                            let fee = u32::from_be_bytes(fee_bytes.0[28..32].try_into().unwrap_or([0; 4]));
-                            let pool_addr = Address::from_slice(&log.data().data[44..64]);
+                let v3_factory_fut = {
+                    let provider = self.rpc.get();
+                    let factories = factory_addresses.clone();
+                    let sig = v3_created;
+                    async move {
+                        let filter = Filter::new()
+                            .address(factories)
+                            .event_signature(sig)
+                            .from_block(from)
+                            .to_block(to);
+                        provider.get_logs(&filter).await.unwrap_or_default()
+                    }
+                };
 
-                            let pool = Pool {
-                                address: pool_addr,
-                                token0,
-                                token1,
-                                dex_name: "NewV3".to_string(),
-                                pool_type: PoolTypeSerializable::V3,
-                                fee,
-                                liquidity_usd: 0.0,
-                                competition_score: 0,
-                                last_bot_tx_count: 0,
-                                last_updated_block: current_block,
-                            };
+                let v2_factory_fut = {
+                    let provider = self.rpc.get();
+                    let factories = factory_addresses.clone();
+                    let sig = v2_created;
+                    async move {
+                        let filter = Filter::new()
+                            .address(factories)
+                            .event_signature(sig)
+                            .from_block(from)
+                            .to_block(to);
+                        provider.get_logs(&filter).await.unwrap_or_default()
+                    }
+                };
 
-                            info!("RT: New V3 pool {} ({}/{})", pool_addr, token0, token1);
-                            let _ = self.tx.send(ChainEvent::NewPool { pool }).await;
-                        }
+                let (v3_logs, v2_logs) = tokio::join!(v3_factory_fut, v2_factory_fut);
+
+                for log in &v3_logs {
+                    if log.topics().len() >= 4 && log.data().data.len() >= 64 {
+                        let token0 = Address::from_word(log.topics()[1]);
+                        let token1 = Address::from_word(log.topics()[2]);
+                        let fee_bytes = log.topics()[3];
+                        let fee = u32::from_be_bytes(fee_bytes.0[28..32].try_into().unwrap_or([0; 4]));
+                        let pool_addr = Address::from_slice(&log.data().data[44..64]);
+
+                        let pool = Pool {
+                            address: pool_addr,
+                            token0,
+                            token1,
+                            dex_name: "NewV3".to_string(),
+                            pool_type: PoolTypeSerializable::V3,
+                            fee,
+                            liquidity_usd: 0.0,
+                            competition_score: 0,
+                            last_bot_tx_count: 0,
+                            last_updated_block: current_block,
+                        };
+
+                        info!("RT: New V3 pool {} ({}/{})", pool_addr, token0, token1);
+                        let _ = self.tx.send(ChainEvent::NewPool { pool }).await;
                     }
                 }
 
-                // V2 factory events
-                let filter_v2 = Filter::new()
-                    .address(factory_addresses.clone())
-                    .event_signature(v2_created)
-                    .from_block(last_block + 1)
-                    .to_block(current_block);
+                for log in &v2_logs {
+                    if log.topics().len() >= 3 && log.data().data.len() >= 64 {
+                        let token0 = Address::from_word(log.topics()[1]);
+                        let token1 = Address::from_word(log.topics()[2]);
+                        let pair_addr = Address::from_slice(&log.data().data[12..32]);
 
-                if let Ok(logs) = provider.get_logs(&filter_v2).await {
-                    for log in &logs {
-                        if log.topics().len() >= 3 && log.data().data.len() >= 64 {
-                            let token0 = Address::from_word(log.topics()[1]);
-                            let token1 = Address::from_word(log.topics()[2]);
-                            let pair_addr = Address::from_slice(&log.data().data[12..32]);
+                        let pool = Pool {
+                            address: pair_addr,
+                            token0,
+                            token1,
+                            dex_name: "NewV2".to_string(),
+                            pool_type: PoolTypeSerializable::V2,
+                            fee: 3000,
+                            liquidity_usd: 0.0,
+                            competition_score: 0,
+                            last_bot_tx_count: 0,
+                            last_updated_block: current_block,
+                        };
 
-                            let pool = Pool {
-                                address: pair_addr,
-                                token0,
-                                token1,
-                                dex_name: "NewV2".to_string(),
-                                pool_type: PoolTypeSerializable::V2,
-                                fee: 3000,
-                                liquidity_usd: 0.0,
-                                competition_score: 0,
-                                last_bot_tx_count: 0,
-                                last_updated_block: current_block,
-                            };
-
-                            info!("RT: New V2 pair {} ({}/{})", pair_addr, token0, token1);
-                            let _ = self.tx.send(ChainEvent::NewPool { pool }).await;
-                        }
+                        info!("RT: New V2 pair {} ({}/{})", pair_addr, token0, token1);
+                        let _ = self.tx.send(ChainEvent::NewPool { pool }).await;
                     }
                 }
             }
