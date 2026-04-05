@@ -3,28 +3,85 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use alloy::sol_types::SolCall;
-use alloy::network::{EthereumWallet, TransactionBuilder};
+use alloy::network::EthereumWallet;
 use alloy::rpc::types::TransactionRequest;
 use eyre::Result;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::Mutex;
 use tracing::{info, warn, error};
 
 use crate::arbitrage::{ArbOpportunity, ArbPath, wei_to_eth};
+use crate::blacklist::TokenBlacklist;
+use crate::gas_predictor::GasPredictor;
+use crate::pnl::{PnlTracker, TxType};
+use crate::pools::{Pool, PoolTypeSerializable};
 use crate::rpc::MultiRpcProvider;
 
 sol! {
     #[sol(rpc)]
-    interface ILongtailArb {
-        /// Flash swap arb: borrow from V3 poolA, sell on poolB, repay, profit
-        function exec(
+    interface IFlashArbV2 {
+        function execDirect(
+            address tokenIn,
+            uint256 amountIn,
             address poolA,
             address poolB,
-            address tokenIn,
-            address tokenOut,
-            uint256 amountIn,
-            bool poolBisV3
+            bool poolAisV3,
+            bool poolBisV3,
+            address tokenBridge
         ) external;
+
+        function execTriangular(
+            uint256 amountIn,
+            address pool1,
+            address pool2,
+            address pool3,
+            bool pool1isV3,
+            bool pool2isV3,
+            bool pool3isV3,
+            address tokenA,
+            address tokenB
+        ) external;
+
+        function withdraw(address token) external;
+    }
+}
+
+/// Thread-safe nonce manager for concurrent tx submission
+pub struct NonceManager {
+    current: AtomicU64,
+    /// Pending nonces that have been allocated but not yet confirmed
+    pending: Mutex<Vec<u64>>,
+}
+
+impl NonceManager {
+    pub fn new(start: u64) -> Self {
+        Self {
+            current: AtomicU64::new(start),
+            pending: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Allocate the next nonce for a transaction
+    pub async fn next(&self) -> u64 {
+        let nonce = self.current.fetch_add(1, Ordering::SeqCst);
+        self.pending.lock().await.push(nonce);
+        nonce
+    }
+
+    /// Confirm a nonce was used (tx confirmed)
+    pub async fn confirm(&self, nonce: u64) {
+        let mut pending = self.pending.lock().await;
+        pending.retain(|&n| n != nonce);
+    }
+
+    /// Resync nonce from chain (after errors)
+    pub fn resync(&self, chain_nonce: u64) {
+        self.current.store(chain_nonce, Ordering::SeqCst);
+    }
+
+    pub fn current(&self) -> u64 {
+        self.current.load(Ordering::SeqCst)
     }
 }
 
@@ -34,10 +91,12 @@ pub struct Executor {
     wallet: Address,
     arb_contract: Option<Address>,
     dry_run: bool,
-    nonce: AtomicU64,
-    total_profit: AtomicU64,
+    nonce_mgr: NonceManager,
     total_attempts: AtomicU64,
     total_successes: AtomicU64,
+    total_profit: AtomicU64,
+    /// Maximum concurrent pending transactions
+    max_pending: usize,
 }
 
 impl Executor {
@@ -48,14 +107,14 @@ impl Executor {
             wallet,
             arb_contract: None,
             dry_run,
-            nonce: AtomicU64::new(0),
-            total_profit: AtomicU64::new(0),
+            nonce_mgr: NonceManager::new(0),
             total_attempts: AtomicU64::new(0),
             total_successes: AtomicU64::new(0),
+            total_profit: AtomicU64::new(0),
+            max_pending: 4, // max 4 concurrent txs
         }
     }
 
-    /// Initialize signing provider from private key
     pub fn init_signer(&mut self, private_key: &str, rpc_url: &str) -> Result<()> {
         let key_hex = private_key.strip_prefix("0x").unwrap_or(private_key);
         let signer: PrivateKeySigner = key_hex.parse()?;
@@ -79,32 +138,33 @@ impl Executor {
     pub async fn init_nonce(&self) -> Result<()> {
         let provider = self.rpc.get();
         let nonce = provider.get_transaction_count(self.wallet).await?;
-        self.nonce.store(nonce, Ordering::SeqCst);
+        self.nonce_mgr.resync(nonce);
         info!("Initialized nonce: {}", nonce);
         Ok(())
     }
 
-    fn next_nonce(&self) -> u64 {
-        self.nonce.fetch_add(1, Ordering::SeqCst)
-    }
-
-    pub async fn simulate_arb(&self, opp: &ArbOpportunity) -> Result<bool> {
-        let provider = self.rpc.get();
-
-        let gas_price = provider.get_gas_price().await.unwrap_or(100_000);
+    /// Simulate arb using gas predictor for cost estimation
+    pub async fn simulate_arb(
+        &self,
+        opp: &ArbOpportunity,
+        gas_predictor: &GasPredictor,
+        pools: &dashmap::DashMap<Address, Pool>,
+    ) -> Result<bool> {
         let estimated_gas = match &opp.path {
-            ArbPath::Direct { .. } => 350_000u128,
-            ArbPath::Triangular { .. } => 500_000u128,
+            ArbPath::Direct { .. } => 350_000u64,
+            ArbPath::Triangular { .. } => 500_000u64,
         };
-        let gas_cost = U256::from(gas_price) * U256::from(estimated_gas);
 
-        if opp.profit_wei <= gas_cost {
+        // Use gas predictor for accurate cost estimation
+        let (profitable, net_profit) = gas_predictor.net_profit_after_gas(opp.profit_wei, estimated_gas);
+        if !profitable {
             return Ok(false);
         }
 
         // eth_call simulation if we have a contract
         if let Some(contract_addr) = self.arb_contract {
-            let calldata = self.encode_arb_call(opp);
+            let provider = self.rpc.get();
+            let calldata = self.encode_arb_call(opp, pools);
             let tx = TransactionRequest::default()
                 .from(self.wallet)
                 .to(contract_addr)
@@ -112,10 +172,9 @@ impl Executor {
 
             match provider.call(tx).await {
                 Ok(_) => {
-                    let net = opp.profit_wei - gas_cost;
                     info!(
                         "SIM OK: {} -> {} | net {:.6} ETH",
-                        opp.dex_a, opp.dex_b, wei_to_eth(net)
+                        opp.dex_a, opp.dex_b, wei_to_eth(net_profit)
                     );
                     return Ok(true);
                 }
@@ -125,11 +184,18 @@ impl Executor {
             }
         }
 
-        // No contract = no simulation = don't execute (avoid wasting gas)
         Ok(false)
     }
 
-    pub async fn execute_arb(&self, opp: &ArbOpportunity) -> Result<()> {
+    /// Execute arb — supports concurrent submission with nonce management
+    pub async fn execute_arb(
+        &self,
+        opp: &ArbOpportunity,
+        gas_predictor: &GasPredictor,
+        pnl: &Mutex<PnlTracker>,
+        blacklist: &Mutex<TokenBlacklist>,
+        pools: &dashmap::DashMap<Address, Pool>,
+    ) -> Result<()> {
         self.total_attempts.fetch_add(1, Ordering::Relaxed);
 
         if self.dry_run {
@@ -148,55 +214,105 @@ impl Executor {
         let signing = match &self.signing_provider {
             Some(p) => p,
             None => {
-                error!("No signing provider - cannot send tx");
+                error!("No signing provider");
                 return Ok(());
             }
         };
 
-        let calldata = self.encode_arb_call(opp);
+        let calldata = self.encode_arb_call(opp, pools);
 
         let estimated_gas = match &opp.path {
             ArbPath::Direct { .. } => 400_000u64,
             ArbPath::Triangular { .. } => 600_000u64,
         };
 
+        // Use gas predictor for optimal gas price
+        let gas_price = gas_predictor.gas_for_urgency(0.7); // slightly aggressive
+
+        let nonce = self.nonce_mgr.next().await;
+
         let tx = TransactionRequest::default()
             .to(contract_addr)
             .input(calldata.into())
-            .gas_limit(estimated_gas);
+            .gas_limit(estimated_gas)
+            .nonce(nonce);
 
         info!(
-            "EXEC: {} -> {} | {:.6} ETH in | gas_limit {}",
-            opp.dex_a, opp.dex_b, wei_to_eth(opp.amount_in), estimated_gas
+            "EXEC: {} -> {} | {:.6} ETH in | nonce {} | gas {:.2}gwei",
+            opp.dex_a, opp.dex_b, wei_to_eth(opp.amount_in), nonce, gas_price as f64 / 1e9
         );
 
         match signing.send_transaction(tx).await {
             Ok(pending) => {
                 let tx_hash = *pending.tx_hash();
-                info!("TX SENT: {:?}", tx_hash);
+                info!("TX SENT: {:?} nonce={}", tx_hash, nonce);
 
                 match tokio::time::timeout(
                     tokio::time::Duration::from_secs(15),
                     pending.get_receipt()
                 ).await {
                     Ok(Ok(receipt)) => {
+                        self.nonce_mgr.confirm(nonce).await;
+                        let gas_used = receipt.gas_used;
+                        let block = receipt.block_number.unwrap_or(0);
+
                         if receipt.status() {
                             self.total_successes.fetch_add(1, Ordering::Relaxed);
-                            info!("TX CONFIRMED: {:?} | gas: {}", tx_hash, receipt.gas_used);
+                            info!("TX CONFIRMED: {:?} | gas: {}", tx_hash, gas_used);
+
+                            // Record success in PnL
+                            let tx_type = match &opp.path {
+                                ArbPath::Direct { .. } => TxType::Direct,
+                                ArbPath::Triangular { .. } => TxType::Triangular,
+                            };
+                            pnl.lock().await.record_success(
+                                block,
+                                &opp.dex_a, &opp.dex_b,
+                                opp.pool_a, opp.pool_b,
+                                opp.token_in, opp.token_bridge,
+                                wei_to_u128(opp.amount_in),
+                                wei_to_u128(opp.profit_wei),
+                                gas_used, gas_price,
+                                tx_type,
+                            );
+
+                            // Record success in blacklist
+                            blacklist.lock().await.record_success(opp.token_bridge, block);
                         } else {
                             warn!("TX REVERTED: {:?}", tx_hash);
+
+                            // Record failure in PnL
+                            pnl.lock().await.record_failure(
+                                block,
+                                &opp.dex_a, &opp.dex_b,
+                                opp.pool_a, opp.pool_b,
+                                opp.token_in, opp.token_bridge,
+                                wei_to_u128(opp.amount_in),
+                                gas_used, gas_price,
+                                "reverted",
+                            );
+
+                            // Record revert in blacklist
+                            blacklist.lock().await.record_revert(opp.token_bridge, gas_used, block);
                         }
                     }
-                    Ok(Err(e)) => warn!("Receipt error: {}", e),
-                    Err(_) => info!("TX pending: {:?}", tx_hash),
+                    Ok(Err(e)) => {
+                        warn!("Receipt error: {}", e);
+                        self.nonce_mgr.confirm(nonce).await;
+                    }
+                    Err(_) => {
+                        info!("TX pending: {:?} nonce={}", tx_hash, nonce);
+                    }
                 }
             }
             Err(e) => {
                 error!("TX send failed: {}", e);
+                self.nonce_mgr.confirm(nonce).await;
+
                 if format!("{}", e).contains("nonce") {
                     let provider = self.rpc.get();
                     if let Ok(n) = provider.get_transaction_count(self.wallet).await {
-                        self.nonce.store(n, Ordering::SeqCst);
+                        self.nonce_mgr.resync(n);
                         warn!("Nonce re-synced to {}", n);
                     }
                 }
@@ -206,32 +322,100 @@ impl Executor {
         Ok(())
     }
 
-    fn encode_arb_call(&self, opp: &ArbOpportunity) -> Vec<u8> {
+    /// Execute auto-withdraw if PnL threshold is met
+    pub async fn auto_withdraw(
+        &self,
+        pnl: &Mutex<PnlTracker>,
+        weth: Address,
+    ) -> Result<bool> {
+        let should_withdraw = pnl.lock().await.should_withdraw();
+        if !should_withdraw || self.dry_run { return Ok(false); }
+
+        let contract_addr = match self.arb_contract {
+            Some(addr) => addr,
+            None => return Ok(false),
+        };
+
+        let signing = match &self.signing_provider {
+            Some(p) => p,
+            None => return Ok(false),
+        };
+
+        let calldata = IFlashArbV2::withdrawCall {
+            token: weth,
+        }.abi_encode();
+
+        let tx = TransactionRequest::default()
+            .to(contract_addr)
+            .input(calldata.into())
+            .gas_limit(100_000u64);
+
+        match signing.send_transaction(tx).await {
+            Ok(pending) => {
+                let tx_hash = *pending.tx_hash();
+                info!("WITHDRAW TX: {:?}", tx_hash);
+
+                if let Ok(Ok(receipt)) = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(15),
+                    pending.get_receipt()
+                ).await {
+                    if receipt.status() {
+                        let balance = pnl.lock().await.contract_balance_wei;
+                        pnl.lock().await.record_withdrawal(balance);
+                        info!("Withdrew {:.6} ETH", balance as f64 / 1e18);
+                        return Ok(true);
+                    }
+                }
+            }
+            Err(e) => error!("Withdraw failed: {}", e),
+        }
+
+        Ok(false)
+    }
+
+    /// Encode the arb call for FlashArbV2 contract (supports V2+V3 on both legs)
+    fn encode_arb_call(&self, opp: &ArbOpportunity, pools: &dashmap::DashMap<Address, Pool>) -> Vec<u8> {
         match &opp.path {
             ArbPath::Direct { pool_buy, pool_sell } => {
-                // Flash swap: borrow from pool_buy (must be V3), sell on pool_sell
-                let call = ILongtailArb::execCall {
+                let pool_a_is_v3 = pools.get(pool_buy)
+                    .map(|p| p.pool_type == PoolTypeSerializable::V3)
+                    .unwrap_or(true);
+                let pool_b_is_v3 = pools.get(pool_sell)
+                    .map(|p| p.pool_type == PoolTypeSerializable::V3)
+                    .unwrap_or(true);
+
+                IFlashArbV2::execDirectCall {
+                    tokenIn: opp.token_in,
+                    amountIn: opp.amount_in,
                     poolA: *pool_buy,
                     poolB: *pool_sell,
-                    tokenIn: opp.token_in,
-                    tokenOut: opp.token_bridge,
-                    amountIn: opp.amount_in,
-                    poolBisV3: true, // TODO: lookup from pool data
-                };
-                call.abi_encode()
+                    poolAisV3: pool_a_is_v3,
+                    poolBisV3: pool_b_is_v3,
+                    tokenBridge: opp.token_bridge,
+                }.abi_encode()
             }
-            ArbPath::Triangular { pool1, pool2: _, pool3: _, token_a, token_b: _ } => {
-                // For triangular, use first and last pool as direct arb
-                // (simplified - full triangular needs contract update)
-                let call = ILongtailArb::execCall {
-                    poolA: *pool1,
-                    poolB: opp.pool_b,
-                    tokenIn: opp.token_in,
-                    tokenOut: *token_a,
+            ArbPath::Triangular { pool1, pool2, pool3, token_a, token_b } => {
+                let pool1_is_v3 = pools.get(pool1)
+                    .map(|p| p.pool_type == PoolTypeSerializable::V3)
+                    .unwrap_or(true);
+                let pool2_is_v3 = pools.get(pool2)
+                    .map(|p| p.pool_type == PoolTypeSerializable::V3)
+                    .unwrap_or(true);
+                let pool3_is_v3 = pools.get(pool3)
+                    .map(|p| p.pool_type == PoolTypeSerializable::V3)
+                    .unwrap_or(true);
+
+                IFlashArbV2::execTriangularCall {
                     amountIn: opp.amount_in,
-                    poolBisV3: true,
-                };
-                call.abi_encode()
+                    pool1: *pool1,
+                    pool2: *pool2,
+                    pool3: *pool3,
+                    pool1isV3: pool1_is_v3,
+                    pool2isV3: pool2_is_v3,
+                    pool3isV3: pool3_is_v3,
+                    tokenA: *token_a,
+                    tokenB: *token_b,
+                }.abi_encode()
             }
         }
     }
@@ -260,4 +444,9 @@ impl Executor {
             self.total_profit.load(Ordering::Relaxed),
         )
     }
+}
+
+#[inline]
+fn wei_to_u128(wei: U256) -> u128 {
+    wei.to::<u128>()
 }

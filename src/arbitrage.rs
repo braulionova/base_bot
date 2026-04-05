@@ -1,34 +1,13 @@
 use alloy::primitives::{Address, U256};
-use alloy::sol;
 use dashmap::DashMap;
 use eyre::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::info;
 
+use crate::multicall;
 use crate::pools::{Pool, PoolTypeSerializable};
 use crate::rpc::MultiRpcProvider;
-
-sol! {
-    #[sol(rpc)]
-    interface IUniswapV2Pair {
-        function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
-    }
-
-    #[sol(rpc)]
-    interface IUniswapV3Pool {
-        function slot0() external view returns (
-            uint160 sqrtPriceX96,
-            int24 tick,
-            uint16 observationIndex,
-            uint16 observationCardinality,
-            uint16 observationCardinalityNext,
-            uint8 feeProtocol,
-            bool unlocked
-        );
-        function liquidity() external view returns (uint128);
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct ArbOpportunity {
@@ -47,12 +26,10 @@ pub struct ArbOpportunity {
 
 #[derive(Debug, Clone)]
 pub enum ArbPath {
-    /// Simple: WETH -> Token -> WETH across two DEXes
     Direct {
         pool_buy: Address,
         pool_sell: Address,
     },
-    /// Triangular: WETH -> A -> B -> WETH
     Triangular {
         pool1: Address,
         pool2: Address,
@@ -62,60 +39,163 @@ pub enum ArbPath {
     },
 }
 
+/// Cached reserve state for a pool — avoids RPC per cycle
+#[derive(Debug, Clone)]
+pub enum PoolState {
+    V2 { reserve0: U256, reserve1: U256 },
+    V3 { sqrt_price_x96: U256, liquidity: u128 },
+    Unknown,
+}
+
+/// Pre-computed pair index: built once, updated incrementally when new pools arrive
+pub struct PairIndex {
+    /// (token0, token1) sorted -> list of pool addresses for cross-DEX arb
+    pub pair_to_pools: HashMap<(Address, Address), Vec<Address>>,
+    /// token -> list of pool addresses (for triangular search)
+    pub token_to_pools: HashMap<Address, Vec<Address>>,
+    /// Cross-DEX arbable pairs: each entry is a vec of pool addrs with 2+ DEXes
+    pub arbable_pairs: Vec<Vec<Address>>,
+    /// WETH pools for triangular arb starting point
+    pub weth_pools: Vec<Address>,
+    /// Snapshot of how many pools were indexed
+    pub indexed_count: usize,
+}
+
+impl PairIndex {
+    pub fn build(pools: &DashMap<Address, Pool>, safe_addrs: &[Address], weth: Address) -> Self {
+        let mut pair_to_pools: HashMap<(Address, Address), Vec<Address>> = HashMap::new();
+        let mut token_to_pools: HashMap<Address, Vec<Address>> = HashMap::new();
+
+        for addr in safe_addrs {
+            if let Some(pool) = pools.get(addr) {
+                let key = sorted_pair(pool.token0, pool.token1);
+                pair_to_pools.entry(key).or_default().push(*addr);
+                token_to_pools.entry(pool.token0).or_default().push(*addr);
+                token_to_pools.entry(pool.token1).or_default().push(*addr);
+            }
+        }
+
+        // Pre-compute cross-DEX arbable pairs
+        let mut arbable_pairs = Vec::new();
+        for (_pair, addrs) in &pair_to_pools {
+            if addrs.len() < 2 { continue; }
+            // Check that at least 2 different DEXes exist
+            let mut dex_set = std::collections::HashSet::new();
+            for addr in addrs {
+                if let Some(p) = pools.get(addr) {
+                    dex_set.insert(p.dex_name.clone());
+                }
+            }
+            if dex_set.len() >= 2 {
+                arbable_pairs.push(addrs.clone());
+            }
+        }
+
+        let weth_pools = token_to_pools.get(&weth).cloned().unwrap_or_default();
+
+        PairIndex {
+            pair_to_pools,
+            token_to_pools,
+            arbable_pairs,
+            weth_pools,
+            indexed_count: safe_addrs.len(),
+        }
+    }
+}
+
 pub struct ArbitrageEngine {
     rpc: Arc<MultiRpcProvider>,
     weth: Address,
+    /// Cached on-chain state per pool address
+    pub reserve_cache: DashMap<Address, PoolState>,
 }
+
+// Trade sizes: sorted descending for greedy best-size-first
+const TRADE_SIZES: [u128; 6] = [
+    50_000_000_000_000_000,  // 0.05 ETH
+    20_000_000_000_000_000,  // 0.02 ETH
+    10_000_000_000_000_000,  // 0.01 ETH
+    5_000_000_000_000_000,   // 0.005 ETH
+    2_000_000_000_000_000,   // 0.002 ETH
+    1_000_000_000_000_000,   // 0.001 ETH
+];
 
 impl ArbitrageEngine {
     pub fn new(rpc: Arc<MultiRpcProvider>) -> Self {
         let weth: Address = "0x4200000000000000000000000000000000000006".parse().unwrap();
-        Self { rpc, weth }
+        Self {
+            rpc,
+            weth,
+            reserve_cache: DashMap::new(),
+        }
     }
 
-    /// Find cross-DEX arbitrage opportunities on priority pools
-    pub async fn find_opportunities(
-        &self,
-        pools: &DashMap<Address, Pool>,
-        priority_addrs: &[Address],
-    ) -> Result<Vec<ArbOpportunity>> {
-        let mut opportunities = Vec::new();
+    /// Refresh all reserves via multicall in 1-2 RPC calls.
+    /// This replaces hundreds of individual getReserves/slot0 calls.
+    pub async fn refresh_reserves(&self, pools: &DashMap<Address, Pool>, addrs: &[Address]) {
+        let mut v2_addrs = Vec::new();
+        let mut v3_addrs = Vec::new();
 
-        // Build a map of token pairs -> pools
-        let mut pair_map: HashMap<(Address, Address), Vec<Pool>> = HashMap::new();
-        // Also build token -> pools map for triangular arb
-        let mut token_pools: HashMap<Address, Vec<Pool>> = HashMap::new();
-
-        for addr in priority_addrs {
+        for addr in addrs {
             if let Some(pool) = pools.get(addr) {
-                let key = if pool.token0 < pool.token1 {
-                    (pool.token0, pool.token1)
-                } else {
-                    (pool.token1, pool.token0)
-                };
-                pair_map.entry(key).or_default().push(pool.clone());
-                token_pools.entry(pool.token0).or_default().push(pool.clone());
-                token_pools.entry(pool.token1).or_default().push(pool.clone());
+                match pool.pool_type {
+                    PoolTypeSerializable::V2 => v2_addrs.push(*addr),
+                    PoolTypeSerializable::V3 => v3_addrs.push(*addr),
+                }
             }
         }
 
-        // 1. Direct cross-DEX arb: same pair on different DEXes
-        for ((_t0, _t1), pool_list) in &pair_map {
-            if pool_list.len() < 2 {
-                continue;
-            }
+        // Fetch V2 and V3 reserves concurrently
+        let (v2_results, v3_results) = tokio::join!(
+            multicall::batch_v2_reserves(&self.rpc, &v2_addrs),
+            multicall::batch_v3_state(&self.rpc, &v3_addrs),
+        );
 
-            for i in 0..pool_list.len() {
-                for j in (i + 1)..pool_list.len() {
-                    let pool_a = &pool_list[i];
-                    let pool_b = &pool_list[j];
+        for (addr, res) in v2_addrs.iter().zip(v2_results.iter()) {
+            if let Some(r) = res {
+                self.reserve_cache.insert(*addr, PoolState::V2 {
+                    reserve0: r.reserve0,
+                    reserve1: r.reserve1,
+                });
+            }
+        }
+
+        for (addr, res) in v3_addrs.iter().zip(v3_results.iter()) {
+            if let Some(s) = res {
+                self.reserve_cache.insert(*addr, PoolState::V3 {
+                    sqrt_price_x96: s.sqrt_price_x96,
+                    liquidity: s.liquidity,
+                });
+            }
+        }
+    }
+
+    /// Find opportunities using pre-computed index and cached reserves (zero RPC in hot path)
+    pub fn find_opportunities_cached(
+        &self,
+        pools: &DashMap<Address, Pool>,
+        index: &PairIndex,
+    ) -> Vec<ArbOpportunity> {
+        let mut opportunities = Vec::new();
+
+        // 1. Direct cross-DEX arb from pre-computed pairs
+        for pool_addrs in &index.arbable_pairs {
+            for i in 0..pool_addrs.len() {
+                for j in (i + 1)..pool_addrs.len() {
+                    let addr_a = pool_addrs[i];
+                    let addr_b = pool_addrs[j];
+
+                    let (pool_a, pool_b) = match (pools.get(&addr_a), pools.get(&addr_b)) {
+                        (Some(a), Some(b)) => (a, b),
+                        _ => continue,
+                    };
 
                     if pool_a.dex_name == pool_b.dex_name {
                         continue;
                     }
 
-                    if let Some(opp) = self.check_pair_arb(pool_a, pool_b).await {
-                        if opp.profit_eth > 0.00002 { // ~$0.05 minimum
+                    if let Some(opp) = self.check_pair_arb_cached(&pool_a, &pool_b) {
+                        if opp.profit_eth > 0.00002 {
                             opportunities.push(opp);
                         }
                     }
@@ -124,31 +204,34 @@ impl ArbitrageEngine {
         }
 
         // 2. Triangular arb: WETH -> A -> B -> WETH
-        if let Some(weth_pools) = token_pools.get(&self.weth) {
-            // Find pools that share a non-WETH token (potential triangle)
-            for pool1 in weth_pools.iter().take(200) {
-                let token_a = if pool1.token0 == self.weth { pool1.token1 } else { pool1.token0 };
+        for &pool1_addr in index.weth_pools.iter().take(200) {
+            let pool1 = match pools.get(&pool1_addr) {
+                Some(p) => p,
+                None => continue,
+            };
+            let token_a = if pool1.token0 == self.weth { pool1.token1 } else { pool1.token0 };
 
-                if let Some(a_pools) = token_pools.get(&token_a) {
-                    for pool2 in a_pools.iter().take(50) {
-                        let token_b = if pool2.token0 == token_a { pool2.token1 } else { pool2.token0 };
-                        if token_b == self.weth || token_b == token_a {
-                            continue;
-                        }
+            if let Some(a_pool_addrs) = index.token_to_pools.get(&token_a) {
+                for &pool2_addr in a_pool_addrs.iter().take(50) {
+                    let pool2 = match pools.get(&pool2_addr) {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    let token_b = if pool2.token0 == token_a { pool2.token1 } else { pool2.token0 };
+                    if token_b == self.weth || token_b == token_a { continue; }
 
-                        // Find a pool B -> WETH
-                        let key_bw = if token_b < self.weth {
-                            (token_b, self.weth)
-                        } else {
-                            (self.weth, token_b)
-                        };
-
-                        if let Some(bw_pools) = pair_map.get(&key_bw) {
-                            for pool3 in bw_pools.iter().take(10) {
-                                if let Some(opp) = self.check_triangle(pool1, pool2, pool3, token_a, token_b).await {
-                                    if opp.profit_eth > 0.00002 { // ~$0.05 minimum
-                                        opportunities.push(opp);
-                                    }
+                    let key_bw = sorted_pair(token_b, self.weth);
+                    if let Some(bw_addrs) = index.pair_to_pools.get(&key_bw) {
+                        for &pool3_addr in bw_addrs.iter().take(10) {
+                            let pool3 = match pools.get(&pool3_addr) {
+                                Some(p) => p,
+                                None => continue,
+                            };
+                            if let Some(opp) = self.check_triangle_cached(
+                                &pool1, &pool2, &pool3, token_a, token_b,
+                            ) {
+                                if opp.profit_eth > 0.00002 {
+                                    opportunities.push(opp);
                                 }
                             }
                         }
@@ -157,11 +240,11 @@ impl ArbitrageEngine {
             }
         }
 
-        opportunities.sort_by(|a, b| b.profit_wei.cmp(&a.profit_wei));
+        opportunities.sort_unstable_by(|a, b| b.profit_wei.cmp(&a.profit_wei));
 
         if !opportunities.is_empty() {
             info!("Found {} arbitrage opportunities", opportunities.len());
-            for opp in &opportunities[..opportunities.len().min(5)] {
+            for opp in opportunities.iter().take(5) {
                 info!(
                     "  {} -> {}: {:.6} ETH profit ({} <-> {})",
                     opp.dex_a, opp.dex_b, opp.profit_eth, opp.pool_a, opp.pool_b
@@ -169,12 +252,11 @@ impl ArbitrageEngine {
             }
         }
 
-        Ok(opportunities)
+        opportunities
     }
 
-    async fn check_pair_arb(&self, pool_a: &Pool, pool_b: &Pool) -> Option<ArbOpportunity> {
-        let provider = self.rpc.get();
-
+    /// Check direct arb using cached reserves — NO RPC calls
+    fn check_pair_arb_cached(&self, pool_a: &Pool, pool_b: &Pool) -> Option<ArbOpportunity> {
         let (token_in, token_bridge) = if pool_a.token0 == self.weth {
             (pool_a.token0, pool_a.token1)
         } else if pool_a.token1 == self.weth {
@@ -183,78 +265,82 @@ impl ArbitrageEngine {
             return None;
         };
 
-        // Trade sizes optimized for $0.05+ profit on longtail pools
-        // Smaller amounts = less slippage on thin pools = better profit ratio
-        let trade_sizes = [
-            U256::from(50_000_000_000_000_000u128),  // 0.05 ETH
-            U256::from(20_000_000_000_000_000u128),  // 0.02 ETH
-            U256::from(10_000_000_000_000_000u128),  // 0.01 ETH
-            U256::from(5_000_000_000_000_000u128),   // 0.005 ETH
-            U256::from(2_000_000_000_000_000u128),   // 0.002 ETH
-            U256::from(1_000_000_000_000_000u128),   // 0.001 ETH
-        ];
+        let state_a = self.reserve_cache.get(&pool_a.address)?;
+        let state_b = self.reserve_cache.get(&pool_b.address)?;
 
-        for amount_in in trade_sizes {
-            let out_a = match self.get_output(provider, pool_a, token_in, token_bridge, amount_in).await {
-                Some(v) if v > U256::ZERO => v,
-                _ => continue,
-            };
+        for &size in &TRADE_SIZES {
+            let amount_in = U256::from(size);
 
-            let out_b = match self.get_output(provider, pool_b, token_bridge, token_in, out_a).await {
-                Some(v) if v > U256::ZERO => v,
-                _ => continue,
-            };
+            let out_a = get_output_cached(&state_a, pool_a, token_in, token_bridge, amount_in)?;
+            if out_a.is_zero() { continue; }
 
-            if out_b > amount_in {
-                let profit_wei = out_b - amount_in;
-                let profit_eth = wei_to_eth(profit_wei);
+            let out_b = get_output_cached(&state_b, pool_b, token_bridge, token_in, out_a)?;
+            if out_b <= amount_in { continue; }
 
-                return Some(ArbOpportunity {
-                    pool_a: pool_a.address,
-                    pool_b: pool_b.address,
-                    dex_a: pool_a.dex_name.clone(),
-                    dex_b: pool_b.dex_name.clone(),
-                    token_in,
-                    token_bridge,
-                    amount_in,
-                    expected_out: out_b,
-                    profit_wei,
-                    profit_eth,
-                    path: ArbPath::Direct {
-                        pool_buy: pool_a.address,
-                        pool_sell: pool_b.address,
-                    },
-                });
-            }
+            let profit_wei = out_b - amount_in;
+            let profit_eth = wei_to_eth(profit_wei);
+
+            return Some(ArbOpportunity {
+                pool_a: pool_a.address,
+                pool_b: pool_b.address,
+                dex_a: pool_a.dex_name.clone(),
+                dex_b: pool_b.dex_name.clone(),
+                token_in,
+                token_bridge,
+                amount_in,
+                expected_out: out_b,
+                profit_wei,
+                profit_eth,
+                path: ArbPath::Direct {
+                    pool_buy: pool_a.address,
+                    pool_sell: pool_b.address,
+                },
+            });
         }
 
         None
     }
 
-    async fn check_triangle(
+    /// Check triangular arb using cached reserves — NO RPC calls
+    /// Now scans multiple trade sizes like direct arb
+    fn check_triangle_cached(
         &self,
-        pool1: &Pool,  // WETH -> A
-        pool2: &Pool,  // A -> B
-        pool3: &Pool,  // B -> WETH
+        pool1: &Pool,
+        pool2: &Pool,
+        pool3: &Pool,
         token_a: Address,
         token_b: Address,
     ) -> Option<ArbOpportunity> {
-        let provider = self.rpc.get();
-        let amount_in = U256::from(10_000_000_000_000_000u128); // 0.01 ETH
+        let state1 = self.reserve_cache.get(&pool1.address)?;
+        let state2 = self.reserve_cache.get(&pool2.address)?;
+        let state3 = self.reserve_cache.get(&pool3.address)?;
 
-        // Step 1: WETH -> A
-        let out1 = self.get_output(provider, pool1, self.weth, token_a, amount_in).await?;
-        if out1.is_zero() { return None; }
+        // Triangular uses smaller sizes (3 legs = more slippage)
+        const TRI_SIZES: [u128; 4] = [
+            20_000_000_000_000_000,  // 0.02 ETH
+            10_000_000_000_000_000,  // 0.01 ETH
+            5_000_000_000_000_000,   // 0.005 ETH
+            2_000_000_000_000_000,   // 0.002 ETH
+        ];
 
-        // Step 2: A -> B
-        let out2 = self.get_output(provider, pool2, token_a, token_b, out1).await?;
-        if out2.is_zero() { return None; }
+        for &size in &TRI_SIZES {
+            let amount_in = U256::from(size);
 
-        // Step 3: B -> WETH
-        let out3 = self.get_output(provider, pool3, token_b, self.weth, out2).await?;
-        if out3.is_zero() { return None; }
+            let out1 = match get_output_cached(&state1, pool1, self.weth, token_a, amount_in) {
+                Some(v) if !v.is_zero() => v,
+                _ => continue,
+            };
 
-        if out3 > amount_in {
+            let out2 = match get_output_cached(&state2, pool2, token_a, token_b, out1) {
+                Some(v) if !v.is_zero() => v,
+                _ => continue,
+            };
+
+            let out3 = match get_output_cached(&state3, pool3, token_b, self.weth, out2) {
+                Some(v) if v > amount_in => v,
+                _ => continue,
+            };
+
             let profit_wei = out3 - amount_in;
             let profit_eth = wei_to_eth(profit_wei);
 
@@ -282,111 +368,78 @@ impl ArbitrageEngine {
         None
     }
 
-    async fn get_output(
+    // Legacy: RPC-based find_opportunities for backwards compat
+    pub async fn find_opportunities(
         &self,
-        provider: &crate::rpc::BoxProvider,
-        pool: &Pool,
-        token_in: Address,
-        token_out: Address,
-        amount_in: U256,
-    ) -> Option<U256> {
-        match pool.pool_type {
-            PoolTypeSerializable::V2 => {
-                self.get_v2_output(provider, pool.address, token_in, token_out, amount_in).await
-            }
-            PoolTypeSerializable::V3 => {
-                self.get_v3_output(provider, pool.address, token_in, token_out, amount_in, pool.fee).await
-            }
-        }
-    }
+        pools: &DashMap<Address, Pool>,
+        priority_addrs: &[Address],
+    ) -> Result<Vec<ArbOpportunity>> {
+        // Refresh reserves via multicall, then use cached path
+        self.refresh_reserves(pools, priority_addrs).await;
 
-    async fn get_v2_output(
-        &self,
-        provider: &crate::rpc::BoxProvider,
-        pair: Address,
-        token_in: Address,
-        token_out: Address,
-        amount_in: U256,
-    ) -> Option<U256> {
-        let contract = IUniswapV2Pair::new(pair, provider);
-        let reserves = match contract.getReserves().call().await {
-            Ok(r) => r,
-            Err(_) => return None,
-        };
-
-        let (reserve_in, reserve_out) = if token_in < token_out {
-            (U256::from(reserves.reserve0), U256::from(reserves.reserve1))
-        } else {
-            (U256::from(reserves.reserve1), U256::from(reserves.reserve0))
-        };
-
-        if reserve_in.is_zero() || reserve_out.is_zero() {
-            return None;
-        }
-
-        // UniswapV2: amountOut = (amountIn * 997 * reserveOut) / (reserveIn * 1000 + amountIn * 997)
-        let amount_in_with_fee = amount_in * U256::from(997);
-        let numerator = amount_in_with_fee * reserve_out;
-        let denominator = reserve_in * U256::from(1000) + amount_in_with_fee;
-
-        if denominator.is_zero() {
-            return None;
-        }
-
-        Some(numerator / denominator)
-    }
-
-    async fn get_v3_output(
-        &self,
-        provider: &crate::rpc::BoxProvider,
-        pool_addr: Address,
-        token_in: Address,
-        token_out: Address,
-        amount_in: U256,
-        fee: u32,
-    ) -> Option<U256> {
-        let pool = IUniswapV3Pool::new(pool_addr, provider);
-
-        let slot0 = match pool.slot0().call().await {
-            Ok(s) => s,
-            Err(_) => return None,
-        };
-        let liquidity = match pool.liquidity().call().await {
-            Ok(l) => l,
-            Err(_) => return None,
-        };
-
-        let sqrt_price = slot0.sqrtPriceX96;
-        let liq = liquidity;
-
-        if liq == 0 || sqrt_price.is_zero() {
-            return None;
-        }
-
-        let zero_for_one = token_in < token_out;
-        let price_x96 = U256::from(sqrt_price);
-        let q96 = U256::from(1u128 << 96);
-
-        let amount_out = if zero_for_one {
-            let price_num = price_x96 * price_x96;
-            let price_denom = q96 * q96;
-            if price_denom.is_zero() { return None; }
-            let raw_out = amount_in * price_num / price_denom;
-            raw_out * U256::from(1_000_000 - fee) / U256::from(1_000_000)
-        } else {
-            let price_num = q96 * q96;
-            let price_denom = price_x96 * price_x96;
-            if price_denom.is_zero() { return None; }
-            let raw_out = amount_in * price_num / price_denom;
-            raw_out * U256::from(1_000_000 - fee) / U256::from(1_000_000)
-        };
-
-        Some(amount_out)
+        // Build a temporary index (in hot loop, caller should use pre-computed PairIndex)
+        let index = PairIndex::build(pools, priority_addrs, self.weth);
+        Ok(self.find_opportunities_cached(pools, &index))
     }
 }
 
+/// Compute output from cached state — pure math, no I/O
+fn get_output_cached(
+    state: &PoolState,
+    pool: &Pool,
+    token_in: Address,
+    _token_out: Address,
+    amount_in: U256,
+) -> Option<U256> {
+    match state {
+        PoolState::V2 { reserve0, reserve1 } => {
+            let (res_in, res_out) = if token_in < pool.token1 {
+                (*reserve0, *reserve1)
+            } else {
+                (*reserve1, *reserve0)
+            };
+            if res_in.is_zero() || res_out.is_zero() { return None; }
+            // amountOut = (amountIn * 997 * reserveOut) / (reserveIn * 1000 + amountIn * 997)
+            let fee_amount = amount_in * U256::from(997);
+            let num = fee_amount * res_out;
+            let den = res_in * U256::from(1000) + fee_amount;
+            if den.is_zero() { return None; }
+            Some(num / den)
+        }
+        PoolState::V3 { sqrt_price_x96, liquidity } => {
+            if *liquidity == 0 || sqrt_price_x96.is_zero() { return None; }
+            let zero_for_one = token_in < _token_out;
+            let price_x96 = *sqrt_price_x96;
+            let q96 = U256::from(1u128 << 96);
+
+            let amount_out = if zero_for_one {
+                let price_num = price_x96 * price_x96;
+                let price_denom = q96 * q96;
+                if price_denom.is_zero() { return None; }
+                let raw_out = amount_in * price_num / price_denom;
+                raw_out * U256::from(1_000_000u32 - pool.fee) / U256::from(1_000_000u32)
+            } else {
+                let price_num = q96 * q96;
+                let price_denom = price_x96 * price_x96;
+                if price_denom.is_zero() { return None; }
+                let raw_out = amount_in * price_num / price_denom;
+                raw_out * U256::from(1_000_000u32 - pool.fee) / U256::from(1_000_000u32)
+            };
+            Some(amount_out)
+        }
+        PoolState::Unknown => None,
+    }
+}
+
+#[inline]
+fn sorted_pair(a: Address, b: Address) -> (Address, Address) {
+    if a < b { (a, b) } else { (b, a) }
+}
+
+/// Convert wei to ETH without string allocation (hot path optimization)
+#[inline]
 pub fn wei_to_eth(wei: U256) -> f64 {
-    let s = format!("{}", wei);
-    let val: f64 = s.parse().unwrap_or(0.0);
-    val / 1e18
+    // For values that fit in u128 (< 3.4e38, i.e. < 3.4e20 ETH — always true)
+    let lo: u128 = wei.to::<u128>();
+    lo as f64 / 1e18
 }

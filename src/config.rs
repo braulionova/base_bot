@@ -18,7 +18,6 @@ impl Config {
         Self {
             wallet_address: Address::from_str("0xd69f9856a569b1655b43b0395b7c2923a217cfe0").unwrap(),
             rpc_urls: vec![
-                "http://localhost:8545".into(),       // Local node (10ms) - first priority
                 "https://mainnet.base.org".into(),
                 "https://base.meowrpc.com".into(),
                 "https://base.publicnode.com".into(),

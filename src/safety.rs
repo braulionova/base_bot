@@ -1,20 +1,10 @@
 use alloy::primitives::Address;
-use alloy::providers::Provider;
-use alloy::sol;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::debug;
 
+use crate::multicall;
 use crate::rpc::MultiRpcProvider;
-
-sol! {
-    #[sol(rpc)]
-    interface IERC20 {
-        function totalSupply() external view returns (uint256);
-        function balanceOf(address account) external view returns (uint256);
-        function decimals() external view returns (uint8);
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct TokenSafetyResult {
@@ -58,6 +48,59 @@ impl SafetyChecker {
         }
     }
 
+    /// Batch check all unique tokens from arbable pools using multicall.
+    /// Returns the set of safe token addresses.
+    pub async fn batch_check_tokens(&mut self, tokens: &[Address]) -> HashSet<Address> {
+        let mut safe = HashSet::new();
+        let mut to_check = Vec::new();
+
+        for &token in tokens {
+            if self.known_safe.contains(&token) {
+                safe.insert(token);
+            } else if !self.known_unsafe.contains(&token) {
+                to_check.push(token);
+            }
+        }
+
+        if to_check.is_empty() {
+            return safe;
+        }
+
+        // Batch fetch totalSupply + decimals via multicall
+        let results = multicall::batch_token_info(&self.rpc, &to_check).await;
+
+        for (token, result) in to_check.iter().zip(results.iter()) {
+            match result {
+                Some((supply, decimals)) => {
+                    if supply.is_zero() {
+                        debug!("Token {} unsafe: zero supply", token);
+                        self.known_unsafe.insert(*token);
+                    } else if *decimals > 24 {
+                        debug!("Token {} unsafe: decimals={}", token, decimals);
+                        self.known_unsafe.insert(*token);
+                    } else {
+                        self.known_safe.insert(*token);
+                        safe.insert(*token);
+                    }
+                }
+                None => {
+                    debug!("Token {} unsafe: call failed", token);
+                    self.known_unsafe.insert(*token);
+                }
+            }
+        }
+
+        safe
+    }
+
+    /// Check if both tokens in a pool are safe (uses cached known_safe/known_unsafe)
+    pub fn check_pool_tokens_cached(&self, token0: Address, token1: Address) -> bool {
+        let t0_safe = self.known_safe.contains(&token0);
+        let t1_safe = self.known_safe.contains(&token1);
+        t0_safe && t1_safe
+    }
+
+    // Legacy single-token check
     pub async fn check_token(&mut self, token: Address) -> TokenSafetyResult {
         if self.known_safe.contains(&token) {
             return TokenSafetyResult {
@@ -77,85 +120,44 @@ impl SafetyChecker {
             };
         }
 
-        let provider = self.rpc.get();
-        let contract = IERC20::new(token, provider);
-
-        // Check totalSupply
-        let total_supply = match contract.totalSupply().call().await {
-            Ok(s) => s,
-            Err(_) => {
-                self.known_unsafe.insert(token);
-                return TokenSafetyResult {
-                    token,
-                    is_safe: false,
-                    is_honeypot: true,
-                    reason: "totalSupply() call failed".into(),
-                };
-            }
-        };
-
-        if total_supply.is_zero() {
-            self.known_unsafe.insert(token);
-            return TokenSafetyResult {
-                token,
-                is_safe: false,
-                is_honeypot: true,
-                reason: "zero total supply".into(),
-            };
-        }
-
-        // Check decimals
-        let decimals = match contract.decimals().call().await {
-            Ok(d) => d,
-            Err(_) => 18,
-        };
-
-        if decimals > 24 {
-            self.known_unsafe.insert(token);
-            return TokenSafetyResult {
-                token,
-                is_safe: false,
-                is_honeypot: true,
-                reason: format!("suspicious decimals: {}", decimals),
-            };
-        }
-
-        // Check code size
-        match provider.get_code_at(token).await {
-            Ok(code) => {
-                if code.len() < 50 {
+        // Fallback: batch of 1
+        let results = multicall::batch_token_info(&self.rpc, &[token]).await;
+        match results.first() {
+            Some(Some((supply, decimals))) => {
+                if supply.is_zero() {
                     self.known_unsafe.insert(token);
                     return TokenSafetyResult {
-                        token,
-                        is_safe: false,
-                        is_honeypot: true,
-                        reason: "code too small or no code".into(),
+                        token, is_safe: false, is_honeypot: true,
+                        reason: "zero total supply".into(),
                     };
                 }
+                if *decimals > 24 {
+                    self.known_unsafe.insert(token);
+                    return TokenSafetyResult {
+                        token, is_safe: false, is_honeypot: true,
+                        reason: format!("suspicious decimals: {}", decimals),
+                    };
+                }
+                self.known_safe.insert(token);
+                TokenSafetyResult {
+                    token, is_safe: true, is_honeypot: false,
+                    reason: "passed safety checks".into(),
+                }
             }
-            Err(_) => {}
-        }
-
-        self.known_safe.insert(token);
-        TokenSafetyResult {
-            token,
-            is_safe: true,
-            is_honeypot: false,
-            reason: "passed basic safety checks".into(),
+            _ => {
+                self.known_unsafe.insert(token);
+                TokenSafetyResult {
+                    token, is_safe: false, is_honeypot: true,
+                    reason: "totalSupply() call failed".into(),
+                }
+            }
         }
     }
 
     pub async fn check_pool_tokens(&mut self, token0: Address, token1: Address) -> bool {
         let r0 = self.check_token(token0).await;
-        if !r0.is_safe {
-            debug!("Token {} unsafe: {}", token0, r0.reason);
-            return false;
-        }
+        if !r0.is_safe { return false; }
         let r1 = self.check_token(token1).await;
-        if !r1.is_safe {
-            debug!("Token {} unsafe: {}", token1, r1.reason);
-            return false;
-        }
-        true
+        r1.is_safe
     }
 }
