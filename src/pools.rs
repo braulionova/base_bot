@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 use tracing::{info, warn};
+use tokio::sync::Semaphore;
 
 use crate::config::dex::{DexFactory, PoolType};
 use crate::rpc::MultiRpcProvider;
@@ -128,7 +129,6 @@ impl PoolDiscovery {
             cached_block + 1
         } else {
             // First run: scan last 1M blocks (~3 weeks on Base)
-            // This captures active longtail pools. Cache will grow over time.
             let lookback = 1_000_000u64;
             info!("First run: scanning last {} blocks", lookback);
             latest_block.saturating_sub(lookback)
@@ -139,23 +139,45 @@ impl PoolDiscovery {
             return Ok(());
         }
 
+        // Parallel discovery across all factories (up to 4 concurrent)
+        info!("Discovering pools from {} factories in parallel, blocks {}-{}",
+            factories.len(), start_block, latest_block);
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+        let mut handles = Vec::new();
+
         for factory in factories {
-            info!("Discovering pools from {} ({}) blocks {}-{}",
-                factory.name, factory.factory, start_block, latest_block);
-            match factory.pool_type {
-                PoolType::UniswapV3 => {
-                    if let Err(e) = self.discover_v3_pools(factory, start_block, latest_block).await {
-                        warn!("Error discovering {} pools: {}", factory.name, e);
+            let sem = semaphore.clone();
+            let rpc = self.rpc.clone();
+            let pools = self.pools.clone();
+            let factory = factory.clone();
+            let sb = start_block;
+            let lb = latest_block;
+
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                let disc = PoolDiscovery { pools, rpc };
+                match factory.pool_type {
+                    PoolType::UniswapV3 => {
+                        if let Err(e) = disc.discover_v3_pools(&factory, sb, lb).await {
+                            warn!("Error discovering {} pools: {}", factory.name, e);
+                        }
+                    }
+                    PoolType::UniswapV2 => {
+                        if let Err(e) = disc.discover_v2_pools(&factory, sb, lb).await {
+                            warn!("Error discovering {} pools: {}", factory.name, e);
+                        }
                     }
                 }
-                PoolType::UniswapV2 => {
-                    if let Err(e) = self.discover_v2_pools(factory, start_block, latest_block).await {
-                        warn!("Error discovering {} pools: {}", factory.name, e);
-                    }
-                }
-            }
-            info!("Total pools discovered so far: {}", self.pools.len());
+                info!("{}: discovery complete", factory.name);
+            }));
         }
+
+        for handle in handles {
+            let _ = handle.await;
+        }
+
+        info!("All factories scanned. Total pools: {}", self.pools.len());
         Ok(())
     }
 

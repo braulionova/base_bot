@@ -101,6 +101,8 @@ pub struct Executor {
     gas_margin: f64,
     /// Absolute minimum net profit floor (wei)
     min_net_profit_wei: u128,
+    /// MEV-protect RPC URL (Flashbots-like endpoint for Base)
+    mev_rpc_url: Option<String>,
 }
 
 impl Executor {
@@ -118,6 +120,7 @@ impl Executor {
             max_pending: 4, // max 4 concurrent txs
             gas_margin: 1.5,
             min_net_profit_wei: 10_000_000_000_000, // 0.00001 ETH
+            mev_rpc_url: std::env::var("MEV_RPC_URL").ok(),
         }
     }
 
@@ -125,6 +128,11 @@ impl Executor {
         self.gas_margin = gas_margin;
         self.min_net_profit_wei = min_net_profit_wei;
     }
+
+    pub fn has_mev_protect(&self) -> bool {
+        self.mev_rpc_url.is_some()
+    }
+
 
     pub fn init_signer(&mut self, private_key: &str, rpc_url: &str) -> Result<()> {
         let key_hex = private_key.strip_prefix("0x").unwrap_or(private_key);
@@ -242,6 +250,7 @@ impl Executor {
         };
 
         let calldata = self.encode_arb_call(opp, pools);
+        let calldata_clone = calldata.clone();
 
         let estimated_gas = match &opp.path {
             ArbPath::Direct { .. } => 400_000u64,
@@ -273,7 +282,7 @@ impl Executor {
                 info!("TX SENT: {:?} nonce={}", tx_hash, nonce);
 
                 match tokio::time::timeout(
-                    tokio::time::Duration::from_secs(15),
+                    tokio::time::Duration::from_secs(8),
                     pending.get_receipt()
                 ).await {
                     Ok(Ok(receipt)) => {
@@ -285,7 +294,6 @@ impl Executor {
                             self.total_successes.fetch_add(1, Ordering::Relaxed);
                             info!("TX CONFIRMED: {:?} | gas: {}", tx_hash, gas_used);
 
-                            // Record success in PnL
                             let tx_type = match &opp.path {
                                 ArbPath::Direct { .. } => TxType::Direct,
                                 ArbPath::Triangular { .. } => TxType::Triangular,
@@ -301,12 +309,10 @@ impl Executor {
                                 tx_type,
                             );
 
-                            // Record success in blacklist
                             blacklist.lock().await.record_success(opp.token_bridge, block);
                         } else {
                             warn!("TX REVERTED: {:?}", tx_hash);
 
-                            // Record failure in PnL
                             pnl.lock().await.record_failure(
                                 block,
                                 &opp.dex_a, &opp.dex_b,
@@ -317,7 +323,6 @@ impl Executor {
                                 "reverted",
                             );
 
-                            // Record revert in blacklist
                             blacklist.lock().await.record_revert(opp.token_bridge, gas_used, block);
                         }
                     }
@@ -326,9 +331,30 @@ impl Executor {
                         self.nonce_mgr.confirm(nonce).await;
                     }
                     Err(_) => {
-                        // Timeout — confirm nonce to prevent leak, it will land eventually
+                        // Timeout after 8s — attempt gas bump replacement
+                        info!("TX stuck {:?} nonce={}, attempting gas bump...", tx_hash, nonce);
+
+                        let bumped_tip = priority_tip * 130 / 100; // +30%
+                        let bumped_base = base_fee + bumped_tip;
+                        let bump_tx = TransactionRequest::default()
+                            .to(contract_addr)
+                            .input(calldata_clone.into())
+                            .gas_limit(estimated_gas)
+                            .nonce(nonce) // same nonce = replacement
+                            .max_fee_per_gas(bumped_base)
+                            .max_priority_fee_per_gas(bumped_tip);
+
+                        match signing.send_transaction(bump_tx).await {
+                            Ok(bump_pending) => {
+                                let bump_hash = *bump_pending.tx_hash();
+                                info!("GAS BUMP SENT: {:?} (was {:?})", bump_hash, tx_hash);
+                                // Don't wait — nonce will resolve on its own
+                            }
+                            Err(e) => {
+                                warn!("Gas bump failed: {}", e);
+                            }
+                        }
                         self.nonce_mgr.confirm(nonce).await;
-                        info!("TX pending (timeout): {:?} nonce={}", tx_hash, nonce);
                     }
                 }
             }

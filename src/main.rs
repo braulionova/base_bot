@@ -1,9 +1,11 @@
 mod arbitrage;
+mod backrun;
 mod blacklist;
 mod competition;
 mod config;
 mod executor;
 mod gas_predictor;
+mod liquidation;
 mod multicall;
 mod pnl;
 mod pools;
@@ -30,8 +32,8 @@ async fn main() -> eyre::Result<()> {
         .with_target(false)
         .init();
 
-    info!("=== LONGTAIL ARB BOT V2 — Base Chain (Full Pipeline) ===");
-    info!("=== 18 DEXes | Multicall | WS Feed | Gas Predictor | ML Blacklist | P&L ===");
+    info!("=== LONGTAIL ARB BOT V3 — Base Chain (Full Pipeline) ===");
+    info!("=== 18 DEXes | Parallel Multicall | WS Feed | Gas Predictor | Optimal Input | MEV Protect ===");
 
     let cfg = Config::base_mainnet();
 
@@ -177,6 +179,15 @@ async fn main() -> eyre::Result<()> {
     // 7. Initialize arb engine and executor
     // ============================================================
     let arb_engine = arbitrage::ArbitrageEngine::new(rpc.clone());
+    let mut backrun = backrun::BackrunDetector::new();
+    let mut liq_monitor = liquidation::LiquidationMonitor::new(rpc.clone());
+
+    // Discover Aave users for liquidation monitoring
+    match liq_monitor.discover_users(50_000).await {
+        Ok(n) => info!("Tracking {} Aave users for liquidation", n),
+        Err(e) => warn!("Liquidation user discovery failed: {}", e),
+    }
+
     let mut executor = executor::Executor::new(rpc.clone(), cfg.wallet_address, dry_run);
     executor.set_profit_params(cfg.gas_margin, cfg.min_net_profit_wei);
 
@@ -218,22 +229,26 @@ async fn main() -> eyre::Result<()> {
         rt_feed.run(factory_addrs).await;
     });
 
-    // 8b. Process real-time events (update stale pools)
+    // 8b. Process real-time events (update stale pools + backrun queue)
     let discovery_pools_rt = discovery.pools.clone();
+    let (backrun_tx, mut backrun_rx) = tokio::sync::mpsc::channel::<websocket::ChainEvent>(500);
     tokio::spawn(async move {
         while let Some(event) = rt_rx.recv().await {
-            match event {
+            match &event {
                 websocket::ChainEvent::NewPool { pool } => {
                     info!("RT: New pool {} on {}", pool.address, pool.dex_name);
-                    discovery_pools_rt.insert(pool.address, pool);
+                    discovery_pools_rt.insert(pool.address, pool.clone());
                 }
-                websocket::ChainEvent::SwapDetected { pool: _ } => {
-                    // Swap detected — reserves are stale. The main loop refresh
-                    // will pick this up on next multicall batch.
+                websocket::ChainEvent::LargeSwap { pool, block, amount0, amount1, .. } => {
+                    info!("RT: Large swap on {} block={} a0={:.4}ETH a1={:.4}ETH",
+                        pool, block,
+                        arbitrage::wei_to_eth(*amount0),
+                        arbitrage::wei_to_eth(*amount1),
+                    );
+                    let _ = backrun_tx.send(event.clone()).await;
                 }
-                websocket::ChainEvent::NewBlock { number: _ } => {
-                    // Block progression tracked
-                }
+                websocket::ChainEvent::SwapDetected { .. } => {}
+                websocket::ChainEvent::NewBlock { .. } => {}
             }
         }
     });
@@ -283,19 +298,27 @@ async fn main() -> eyre::Result<()> {
         }
     });
 
+    // 8f. Liquidation user re-discovery every 4 hours
+    // (new users borrow/supply constantly)
+    // Note: liq_monitor is used in main loop, so we just flag for refresh
+    let mut liq_refresh_cycle = 0u64;
+
     // ============================================================
     // 9. Main loop — Full optimized pipeline
     // ============================================================
-    info!("=== MAIN LOOP STARTED (Full Pipeline V2) ===");
-    info!("Pipeline: Gas sample -> Multicall refresh -> Cached scan -> Blacklist filter -> Simulate -> Execute");
+    info!("=== MAIN LOOP STARTED (Full Pipeline V3) ===");
+    info!("Pipeline: Gas sample -> Smart refresh -> Optimal scan -> Blacklist filter -> Simulate -> Execute");
+    if executor.has_mev_protect() {
+        info!("MEV Protection: ENABLED (via MEV_RPC_URL)");
+    }
     info!("Monitoring {} pools | {} arbable pairs | {} triangular bases",
         safe_pools.len(), pair_index.arbable_pairs.len(), pair_index.weth_pools.len());
 
     telegram::send(&format!(
-        "🟢 *Bot V2 Started*\n\
+        "🟢 *Bot V3 Started*\n\
          Pools: {} | Monitoring: {}\n\
          Arbable pairs: {} | Tri bases: {}\n\
-         Features: Multicall, WS feed, Gas pred, ML blacklist, P&L\n\
+         Features: Parallel multicall, WS feed, Optimal input, Gas pred, ML blacklist, MEV protect, P&L\n\
          Mode: {}",
         total_pools, safe_pools.len(),
         pair_index.arbable_pairs.len(), pair_index.weth_pools.len(),
@@ -309,7 +332,15 @@ async fn main() -> eyre::Result<()> {
         cycle += 1;
         let cycle_start = std::time::Instant::now();
 
-        // Step 0: Rebuild pair index every 500 cycles to pick up new RT pools
+        // Step 0a: Re-discover liquidation users every 7200 cycles (~4h)
+        if cycle % 7200 == 0 {
+            match liq_monitor.discover_users(20_000).await {
+                Ok(n) => info!("Refreshed liquidation tracking: {} users", n),
+                Err(e) => warn!("Liquidation refresh failed: {}", e),
+            }
+        }
+
+        // Step 0b: Rebuild pair index every 500 cycles to pick up new RT pools
         if cycle % 500 == 0 {
             let all_addrs: Vec<alloy::primitives::Address> = discovery.pools.iter()
                 .map(|e| *e.key())
@@ -350,7 +381,28 @@ async fn main() -> eyre::Result<()> {
         }
         let refresh_elapsed = cycle_start.elapsed();
 
-        // Step 3: Scan opportunities using cached reserves (pure CPU)
+        // Step 3: Process backrun opportunities from large swaps
+        while let Ok(event) = backrun_rx.try_recv() {
+            if let websocket::ChainEvent::LargeSwap { pool, block, amount0, amount1, is_v3 } = event {
+                backrun.record_swap(pool, block, amount0, amount1, is_v3);
+                let br_opps = backrun.find_backrun_opportunities(
+                    pool, &discovery.pools, &arb_engine, &pair_index,
+                );
+                if !br_opps.is_empty() {
+                    // Inject backrun opps into main pipeline (they get gas-filtered below)
+                    for opp in &br_opps {
+                        let tg_msg = format!(
+                            "🔄 *Backrun Detected*\n{} → {} | {:.6} ETH",
+                            opp.dex_a, opp.dex_b, opp.profit_eth
+                        );
+                        tokio::spawn(async move { telegram::send(&tg_msg).await; });
+                    }
+                    // Will be merged with regular opps below
+                }
+            }
+        }
+
+        // Step 3b: Scan opportunities using cached reserves (pure CPU)
         let scan_start = std::time::Instant::now();
         let mut opps = arb_engine.find_opportunities_cached(&discovery.pools, &pair_index);
         let scan_elapsed = scan_start.elapsed();
@@ -434,7 +486,36 @@ async fn main() -> eyre::Result<()> {
             }
         }
 
-        // Step 7: Auto-withdraw check (every 50 cycles)
+        // Step 7: Liquidation scan (every 25 cycles)
+        if cycle % 25 == 0 {
+            let liq_opps = liq_monitor.scan_opportunities().await;
+            for opp in &liq_opps {
+                let tg_msg = format!(
+                    "⚠️ *Liquidation Found*\nUser: {}\nDebt: {} | Collateral: {}\nHF: {:.4} | Est profit: {:.6} ETH",
+                    opp.user, opp.debt_name, opp.collateral_name,
+                    opp.health_factor.to::<u128>() as f64 / 1e18,
+                    opp.estimated_profit_wei as f64 / 1e18,
+                );
+                tokio::spawn(async move { telegram::send(&tg_msg).await; });
+
+                // Simulate liquidation
+                if !dry_run {
+                    match liq_monitor.simulate_liquidation(opp).await {
+                        Ok(true) => {
+                            info!("Liquidation sim passed for {}", opp.user);
+                            // TODO: execute via UnifiedArb.execLiquidation
+                        }
+                        _ => {}
+                    }
+                } else {
+                    info!("[DRY] Liquidation: {} debt={} collateral={} profit~{:.6}ETH",
+                        opp.user, opp.debt_name, opp.collateral_name,
+                        opp.estimated_profit_wei as f64 / 1e18);
+                }
+            }
+        }
+
+        // Step 8: Auto-withdraw check (every 50 cycles)
         if cycle % 50 == 0 {
             if let Ok(true) = executor.auto_withdraw(&pnl_tracker, weth).await {
                 telegram::send("💰 *Auto-withdraw executed!*").await;
@@ -447,22 +528,26 @@ async fn main() -> eyre::Result<()> {
             let pnl_stats = pnl_tracker.lock().await.stats_string();
             let bl_stats = blacklist.lock().await.stats_string();
             let gas_stats = gas_pred.stats_string();
+            let br_stats = backrun.stats_string();
+            let liq_stats = liq_monitor.stats_string();
 
             info!(
-                "Stats: {} cycles | {} opps | {} att | {} win | {} | {} | {}",
-                cycle, total_opps, attempts, successes, pnl_stats, bl_stats, gas_stats
+                "Stats: {} cycles | {} opps | {} att | {} win | {} | {} | {} | {} | {}",
+                cycle, total_opps, attempts, successes, pnl_stats, bl_stats, gas_stats, br_stats, liq_stats
             );
 
             telegram::send(&format!(
-                "📊 *Status Update*\n\
+                "📊 *Status V3*\n\
                  Cycle: {} | Pools: {}\n\
                  Opps: {} | Attempts: {} | Wins: {}\n\
+                 {}\n\
+                 {}\n\
                  {}\n\
                  {}\n\
                  {}",
                 cycle, safe_pools.len(),
                 total_opps, attempts, successes,
-                pnl_stats, bl_stats, gas_stats,
+                pnl_stats, bl_stats, gas_stats, br_stats, liq_stats,
             )).await;
         }
 

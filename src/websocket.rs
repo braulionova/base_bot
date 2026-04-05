@@ -1,10 +1,10 @@
-use alloy::primitives::{Address, FixedBytes};
+use alloy::primitives::{Address, FixedBytes, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::Filter;
 use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{info, error};
+use tracing::{info, error, debug};
 
 use crate::pools::{Pool, PoolTypeSerializable};
 use crate::rpc::MultiRpcProvider;
@@ -16,6 +16,14 @@ pub enum ChainEvent {
     NewBlock { number: u64 },
     /// Swap detected on a monitored pool — reserves likely stale
     SwapDetected { pool: Address },
+    /// Large swap detected — backrun opportunity
+    LargeSwap {
+        pool: Address,
+        block: u64,
+        amount0: U256,
+        amount1: U256,
+        is_v3: bool,
+    },
     /// New pool created
     NewPool { pool: Pool },
 }
@@ -112,7 +120,7 @@ impl RealtimeFeed {
                     let addrs = v3_addrs.clone();
                     let sig = v3_swap;
                     async move {
-                        let mut swaps = Vec::new();
+                        let mut swaps: Vec<(Address, U256, U256)> = Vec::new();
                         for chunk in addrs.chunks(100) {
                             let filter = Filter::new()
                                 .address(chunk.to_vec())
@@ -121,7 +129,16 @@ impl RealtimeFeed {
                                 .to_block(to);
                             if let Ok(logs) = provider.get_logs(&filter).await {
                                 for log in &logs {
-                                    swaps.push(log.address());
+                                    // V3 Swap(sender, recipient, amount0, amount1, sqrtPriceX96, liquidity, tick)
+                                    // amount0 and amount1 are int256 in data[0..32] and data[32..64]
+                                    let (a0, a1) = if log.data().data.len() >= 64 {
+                                        let a0 = U256::from_be_slice(&log.data().data[0..32]);
+                                        let a1 = U256::from_be_slice(&log.data().data[32..64]);
+                                        (a0, a1)
+                                    } else {
+                                        (U256::ZERO, U256::ZERO)
+                                    };
+                                    swaps.push((log.address(), a0, a1));
                                 }
                             }
                         }
@@ -134,7 +151,7 @@ impl RealtimeFeed {
                     let addrs = v2_addrs.clone();
                     let sig = v2_swap;
                     async move {
-                        let mut swaps = Vec::new();
+                        let mut swaps: Vec<(Address, U256, U256)> = Vec::new();
                         for chunk in addrs.chunks(100) {
                             let filter = Filter::new()
                                 .address(chunk.to_vec())
@@ -143,7 +160,19 @@ impl RealtimeFeed {
                                 .to_block(to);
                             if let Ok(logs) = provider.get_logs(&filter).await {
                                 for log in &logs {
-                                    swaps.push(log.address());
+                                    // V2 Swap(sender, amount0In, amount1In, amount0Out, amount1Out, to)
+                                    // data: [amount0In, amount1In, amount0Out, amount1Out]
+                                    let (a0, a1) = if log.data().data.len() >= 128 {
+                                        let a0_in = U256::from_be_slice(&log.data().data[0..32]);
+                                        let a1_in = U256::from_be_slice(&log.data().data[32..64]);
+                                        let a0_out = U256::from_be_slice(&log.data().data[64..96]);
+                                        let a1_out = U256::from_be_slice(&log.data().data[96..128]);
+                                        // Total volume = max of in/out
+                                        (a0_in.max(a0_out), a1_in.max(a1_out))
+                                    } else {
+                                        (U256::ZERO, U256::ZERO)
+                                    };
+                                    swaps.push((log.address(), a0, a1));
                                 }
                             }
                         }
@@ -153,10 +182,29 @@ impl RealtimeFeed {
 
                 let (v3_swaps, v2_swaps) = tokio::join!(v3_fut, v2_fut);
 
-                // Mark swapped pools as stale for priority refresh
-                for addr in v3_swaps.iter().chain(v2_swaps.iter()) {
+                // Large swap threshold: ~0.5 ETH equivalent (backrun-worthy)
+                let large_threshold = U256::from(500_000_000_000_000_000u128); // 0.5 ETH
+
+                // Mark swapped pools as stale + detect large swaps for backrun
+                for (addr, a0, a1) in v3_swaps.iter() {
                     self.stale_pools.insert(*addr, ());
                     let _ = self.tx.send(ChainEvent::SwapDetected { pool: *addr }).await;
+                    if *a0 > large_threshold || *a1 > large_threshold {
+                        let _ = self.tx.send(ChainEvent::LargeSwap {
+                            pool: *addr, block: current_block,
+                            amount0: *a0, amount1: *a1, is_v3: true,
+                        }).await;
+                    }
+                }
+                for (addr, a0, a1) in v2_swaps.iter() {
+                    self.stale_pools.insert(*addr, ());
+                    let _ = self.tx.send(ChainEvent::SwapDetected { pool: *addr }).await;
+                    if *a0 > large_threshold || *a1 > large_threshold {
+                        let _ = self.tx.send(ChainEvent::LargeSwap {
+                            pool: *addr, block: current_block,
+                            amount0: *a0, amount1: *a1, is_v3: false,
+                        }).await;
+                    }
                 }
             }
 

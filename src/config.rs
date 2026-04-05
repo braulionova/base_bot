@@ -22,13 +22,14 @@ impl Config {
         Self {
             wallet_address: Address::from_str("0xd69f9856a569b1655b43b0395b7c2923a217cfe0").unwrap(),
             rpc_urls: vec![
-                // Sorted by latency from us-east-1 (colocation)
-                "https://gateway.tenderly.co/public/base".into(),   // ~47ms GCP anycast
-                "https://base.drpc.org".into(),                      // ~50ms Cloudflare IAD
-                "https://base-mainnet.public.blastapi.io".into(),    // ~57ms Cloudflare IAD
-                "https://base-rpc.publicnode.com".into(),            // ~63ms Cloudflare IAD
-                "https://mainnet.base.org".into(),                   // ~65ms Coinbase official
-                "https://base.publicnode.com".into(),                // ~67ms fallback
+                // Local node first (colocation, <1ms)
+                "http://127.0.0.1:8545".into(),
+                // Public fallbacks while node syncs
+                "https://base.drpc.org".into(),
+                "https://base-mainnet.public.blastapi.io".into(),
+                "https://mainnet.base.org".into(),
+                "https://base-rpc.publicnode.com".into(),
+                "https://base.publicnode.com".into(),
             ],
             chain_id: 8453,
             min_profit_wei: 20_000_000_000_000, // 0.00002 ETH = ~$0.05 target

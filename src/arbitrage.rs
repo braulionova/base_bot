@@ -110,15 +110,16 @@ pub struct ArbitrageEngine {
     pub reserve_cache: DashMap<Address, PoolState>,
 }
 
-// Trade sizes: sorted descending for greedy best-size-first
-const TRADE_SIZES: [u128; 6] = [
-    50_000_000_000_000_000,  // 0.05 ETH
-    20_000_000_000_000_000,  // 0.02 ETH
+// Coarse trade sizes for initial scan (find profitable direction fast)
+const SCAN_SIZES: [u128; 4] = [
+    30_000_000_000_000_000,  // 0.03 ETH
     10_000_000_000_000_000,  // 0.01 ETH
-    5_000_000_000_000_000,   // 0.005 ETH
-    2_000_000_000_000_000,   // 0.002 ETH
+    3_000_000_000_000_000,   // 0.003 ETH
     1_000_000_000_000_000,   // 0.001 ETH
 ];
+
+/// Minimum liquidity in reserve to consider a pool (avoid dust pools)
+const MIN_RESERVE_WEI: u128 = 100_000_000_000_000; // 0.0001 ETH equivalent
 
 impl ArbitrageEngine {
     pub fn new(rpc: Arc<MultiRpcProvider>) -> Self {
@@ -300,7 +301,8 @@ impl ArbitrageEngine {
         opportunities
     }
 
-    /// Check direct arb using cached reserves — NO RPC calls
+    /// Check direct arb using cached reserves — NO RPC calls.
+    /// Uses coarse scan + binary search to find optimal input amount.
     fn check_pair_arb_cached(&self, pool_a: &Pool, pool_b: &Pool) -> Option<ArbOpportunity> {
         let (token_in, token_bridge) = if pool_a.token0 == self.weth {
             (pool_a.token0, pool_a.token1)
@@ -313,41 +315,78 @@ impl ArbitrageEngine {
         let state_a = self.reserve_cache.get(&pool_a.address)?;
         let state_b = self.reserve_cache.get(&pool_b.address)?;
 
-        for &size in &TRADE_SIZES {
-            let amount_in = U256::from(size);
+        // Liquidity floor check — skip dust pools
+        if !has_min_liquidity(&state_a) || !has_min_liquidity(&state_b) {
+            return None;
+        }
 
+        // Phase 1: Coarse scan to find profitable range
+        let mut best_profit = U256::ZERO;
+        let mut best_size: u128 = 0;
+
+        for &size in &SCAN_SIZES {
+            let amount_in = U256::from(size);
             let out_a = get_output_cached(&state_a, pool_a, token_in, token_bridge, amount_in)?;
             if out_a.is_zero() { continue; }
-
             let out_b = get_output_cached(&state_b, pool_b, token_bridge, token_in, out_a)?;
             if out_b <= amount_in { continue; }
 
-            let profit_wei = out_b - amount_in;
-            let profit_eth = wei_to_eth(profit_wei);
-
-            return Some(ArbOpportunity {
-                pool_a: pool_a.address,
-                pool_b: pool_b.address,
-                dex_a: pool_a.dex_name.clone(),
-                dex_b: pool_b.dex_name.clone(),
-                token_in,
-                token_bridge,
-                amount_in,
-                expected_out: out_b,
-                profit_wei,
-                profit_eth,
-                path: ArbPath::Direct {
-                    pool_buy: pool_a.address,
-                    pool_sell: pool_b.address,
-                },
-            });
+            let profit = out_b - amount_in;
+            if profit > best_profit {
+                best_profit = profit;
+                best_size = size;
+            }
         }
 
-        None
+        if best_size == 0 {
+            return None;
+        }
+
+        // Phase 2: Binary search around best_size to maximize profit (8 iterations)
+        let mut lo = best_size / 3;
+        let mut hi = (best_size * 3).min(100_000_000_000_000_000); // cap at 0.1 ETH
+        for _ in 0..8 {
+            if hi - lo < 500_000_000_000_000 { break; } // 0.0005 ETH precision
+            let mid1 = lo + (hi - lo) / 3;
+            let mid2 = hi - (hi - lo) / 3;
+
+            let p1 = calc_direct_profit(&state_a, pool_a, &state_b, pool_b, token_in, token_bridge, U256::from(mid1));
+            let p2 = calc_direct_profit(&state_a, pool_a, &state_b, pool_b, token_in, token_bridge, U256::from(mid2));
+
+            if p1 < p2 {
+                lo = mid1;
+            } else {
+                hi = mid2;
+            }
+        }
+
+        let optimal_in = U256::from((lo + hi) / 2);
+        let out_a = get_output_cached(&state_a, pool_a, token_in, token_bridge, optimal_in)?;
+        let out_b = get_output_cached(&state_b, pool_b, token_bridge, token_in, out_a)?;
+        if out_b <= optimal_in { return None; }
+
+        let profit_wei = out_b - optimal_in;
+        let profit_eth = wei_to_eth(profit_wei);
+
+        Some(ArbOpportunity {
+            pool_a: pool_a.address,
+            pool_b: pool_b.address,
+            dex_a: pool_a.dex_name.clone(),
+            dex_b: pool_b.dex_name.clone(),
+            token_in,
+            token_bridge,
+            amount_in: optimal_in,
+            expected_out: out_b,
+            profit_wei,
+            profit_eth,
+            path: ArbPath::Direct {
+                pool_buy: pool_a.address,
+                pool_sell: pool_b.address,
+            },
+        })
     }
 
-    /// Check triangular arb using cached reserves — NO RPC calls
-    /// Now scans multiple trade sizes like direct arb
+    /// Check triangular arb using cached reserves + ternary search optimization.
     fn check_triangle_cached(
         &self,
         pool1: &Pool,
@@ -360,57 +399,80 @@ impl ArbitrageEngine {
         let state2 = self.reserve_cache.get(&pool2.address)?;
         let state3 = self.reserve_cache.get(&pool3.address)?;
 
-        // Triangular uses smaller sizes (3 legs = more slippage)
-        const TRI_SIZES: [u128; 4] = [
-            20_000_000_000_000_000,  // 0.02 ETH
-            10_000_000_000_000_000,  // 0.01 ETH
-            5_000_000_000_000_000,   // 0.005 ETH
-            2_000_000_000_000_000,   // 0.002 ETH
-        ];
-
-        for &size in &TRI_SIZES {
-            let amount_in = U256::from(size);
-
-            let out1 = match get_output_cached(&state1, pool1, self.weth, token_a, amount_in) {
-                Some(v) if !v.is_zero() => v,
-                _ => continue,
-            };
-
-            let out2 = match get_output_cached(&state2, pool2, token_a, token_b, out1) {
-                Some(v) if !v.is_zero() => v,
-                _ => continue,
-            };
-
-            let out3 = match get_output_cached(&state3, pool3, token_b, self.weth, out2) {
-                Some(v) if v > amount_in => v,
-                _ => continue,
-            };
-
-            let profit_wei = out3 - amount_in;
-            let profit_eth = wei_to_eth(profit_wei);
-
-            return Some(ArbOpportunity {
-                pool_a: pool1.address,
-                pool_b: pool3.address,
-                dex_a: pool1.dex_name.clone(),
-                dex_b: pool3.dex_name.clone(),
-                token_in: self.weth,
-                token_bridge: token_a,
-                amount_in,
-                expected_out: out3,
-                profit_wei,
-                profit_eth,
-                path: ArbPath::Triangular {
-                    pool1: pool1.address,
-                    pool2: pool2.address,
-                    pool3: pool3.address,
-                    token_a,
-                    token_b,
-                },
-            });
+        // Liquidity floor
+        if !has_min_liquidity(&state1) || !has_min_liquidity(&state2) || !has_min_liquidity(&state3) {
+            return None;
         }
 
-        None
+        // Coarse scan for triangular (smaller sizes due to 3 legs)
+        const TRI_SCAN: [u128; 3] = [
+            15_000_000_000_000_000,  // 0.015 ETH
+            5_000_000_000_000_000,   // 0.005 ETH
+            1_500_000_000_000_000,   // 0.0015 ETH
+        ];
+
+        let weth = self.weth;
+        let mut best_profit = U256::ZERO;
+        let mut best_size: u128 = 0;
+
+        for &size in &TRI_SCAN {
+            let amount_in = U256::from(size);
+            let profit = calc_triangle_profit(
+                &state1, pool1, &state2, pool2, &state3, pool3,
+                weth, token_a, token_b, amount_in,
+            );
+            if profit > best_profit {
+                best_profit = profit;
+                best_size = size;
+            }
+        }
+
+        if best_size == 0 { return None; }
+
+        // Ternary search optimization (6 iterations for triangular)
+        let mut lo = best_size / 3;
+        let mut hi = (best_size * 3).min(50_000_000_000_000_000); // cap at 0.05 ETH
+        for _ in 0..6 {
+            if hi - lo < 500_000_000_000_000 { break; }
+            let mid1 = lo + (hi - lo) / 3;
+            let mid2 = hi - (hi - lo) / 3;
+
+            let p1 = calc_triangle_profit(&state1, pool1, &state2, pool2, &state3, pool3, weth, token_a, token_b, U256::from(mid1));
+            let p2 = calc_triangle_profit(&state1, pool1, &state2, pool2, &state3, pool3, weth, token_a, token_b, U256::from(mid2));
+
+            if p1 < p2 { lo = mid1; } else { hi = mid2; }
+        }
+
+        let optimal_in = U256::from((lo + hi) / 2);
+        let out1 = get_output_cached(&state1, pool1, weth, token_a, optimal_in)?;
+        if out1.is_zero() { return None; }
+        let out2 = get_output_cached(&state2, pool2, token_a, token_b, out1)?;
+        if out2.is_zero() { return None; }
+        let out3 = get_output_cached(&state3, pool3, token_b, weth, out2)?;
+        if out3 <= optimal_in { return None; }
+
+        let profit_wei = out3 - optimal_in;
+        let profit_eth = wei_to_eth(profit_wei);
+
+        Some(ArbOpportunity {
+            pool_a: pool1.address,
+            pool_b: pool3.address,
+            dex_a: pool1.dex_name.clone(),
+            dex_b: pool3.dex_name.clone(),
+            token_in: weth,
+            token_bridge: token_a,
+            amount_in: optimal_in,
+            expected_out: out3,
+            profit_wei,
+            profit_eth,
+            path: ArbPath::Triangular {
+                pool1: pool1.address,
+                pool2: pool2.address,
+                pool3: pool3.address,
+                token_a,
+                token_b,
+            },
+        })
     }
 
     // Legacy: RPC-based find_opportunities for backwards compat
@@ -487,6 +549,61 @@ fn get_output_cached(
     }
 }
 
+/// Check if pool has minimum liquidity to avoid dust pools
+#[inline]
+fn has_min_liquidity(state: &PoolState) -> bool {
+    match state {
+        PoolState::V2 { reserve0, reserve1 } => {
+            *reserve0 >= U256::from(MIN_RESERVE_WEI) || *reserve1 >= U256::from(MIN_RESERVE_WEI)
+        }
+        PoolState::V3 { liquidity, .. } => *liquidity > 1000,
+        PoolState::Unknown => false,
+    }
+}
+
+/// Calculate direct arb profit for a given input amount (pure math)
+#[inline]
+fn calc_direct_profit(
+    state_a: &PoolState, pool_a: &Pool,
+    state_b: &PoolState, pool_b: &Pool,
+    token_in: Address, token_bridge: Address,
+    amount_in: U256,
+) -> U256 {
+    let out_a = match get_output_cached(state_a, pool_a, token_in, token_bridge, amount_in) {
+        Some(v) if !v.is_zero() => v,
+        _ => return U256::ZERO,
+    };
+    let out_b = match get_output_cached(state_b, pool_b, token_bridge, token_in, out_a) {
+        Some(v) if v > amount_in => v,
+        _ => return U256::ZERO,
+    };
+    out_b - amount_in
+}
+
+/// Calculate triangular arb profit for a given input amount (pure math)
+#[inline]
+fn calc_triangle_profit(
+    state1: &PoolState, pool1: &Pool,
+    state2: &PoolState, pool2: &Pool,
+    state3: &PoolState, pool3: &Pool,
+    weth: Address, token_a: Address, token_b: Address,
+    amount_in: U256,
+) -> U256 {
+    let out1 = match get_output_cached(state1, pool1, weth, token_a, amount_in) {
+        Some(v) if !v.is_zero() => v,
+        _ => return U256::ZERO,
+    };
+    let out2 = match get_output_cached(state2, pool2, token_a, token_b, out1) {
+        Some(v) if !v.is_zero() => v,
+        _ => return U256::ZERO,
+    };
+    let out3 = match get_output_cached(state3, pool3, token_b, weth, out2) {
+        Some(v) if v > amount_in => v,
+        _ => return U256::ZERO,
+    };
+    out3 - amount_in
+}
+
 #[inline]
 fn sorted_pair(a: Address, b: Address) -> (Address, Address) {
     if a < b { (a, b) } else { (b, a) }
@@ -495,7 +612,6 @@ fn sorted_pair(a: Address, b: Address) -> (Address, Address) {
 /// Convert wei to ETH without string allocation (hot path optimization)
 #[inline]
 pub fn wei_to_eth(wei: U256) -> f64 {
-    // For values that fit in u128 (< 3.4e38, i.e. < 3.4e20 ETH — always true)
     let lo: u128 = wei.to::<u128>();
     lo as f64 / 1e18
 }
